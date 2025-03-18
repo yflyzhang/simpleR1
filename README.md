@@ -1,5 +1,5 @@
+<h1 align="center"> simpleR1: A simple implementation of DeepSeek R1 using GRPO</h1>
 
-# simpleR1: A simple implementation of DeepSeek R1 using GRPO
 
 **simpleR1** is a simple implementation of DeepSeek R1, a large language model designed for reasoning tasks like math and code. This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](https://github.com/huggingface/open-r1) project, with a focus on ease of use and enhanced training features. 
 
@@ -16,6 +16,10 @@
 
 -  Compatible with Hugging Face TRL and open-r1 workflows and scripts.
 
+
+<p align="center">
+  <img src="imgs/running_example.png" width="650" />
+</p>
 
 <!-- 
 ## Installation
