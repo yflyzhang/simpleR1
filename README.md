@@ -4,7 +4,12 @@
 **simpleR1** is a simple implementation of DeepSeek R1, a large language model designed for reasoning tasks like math and code. This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](https://github.com/huggingface/open-r1) project, with a focus on ease of use and enhanced training features. 
 
 
-<a src="https://wandb.ai/yflyzhang/DeepSeekR1/reports/SimpleR1-Examples--VmlldzoxMTg1Njc0NQ" style="border:none;height:1024px;width:100%"></a>
+<p align="left">
+  <img src="imgs/running_example.png" width="900" />
+    <strong>Fig 1. One simpleR1 running example.</strong>
+    The raw wandb logs can be found here: 
+    <a href="https://api.wandb.ai/links/yflyzhang/glqtlifu">link</a>
+</p>
 
 
 
@@ -17,23 +22,9 @@
 -  Compatible with Hugging Face TRL and open-r1 workflows and scripts.
 
 
-<p align="center">
-  <img src="imgs/running_example.png" width="650" />
-</p>
-
-<!-- 
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/simpleR1.git
-   cd simpleR1
 
 
-## Features
-- Built on Hugging Face's TRL library for reinforcement learning.
-- Enhanced GRPO trainer with multi-iteration support and time estimation.
- -->
+
 
 
 ## 📁 Repository Structure
@@ -103,7 +94,7 @@ src/run_grpo.py \
     --beta 0.05 \
     --learning_rate 5e-5 \
     --save_strategy epoch \
-    --log_level debug \
+    --log_level info \     # change to 'debug' will show debug information
     --wandb_project simpleR1 \
     --run_name $run_name \
 ```
