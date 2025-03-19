@@ -14,10 +14,8 @@
 #
 # Modifications copyright (C) 2025 yflyzhang. All rights reserved.
 # Modifications are licensed under the Apache License, Version 2.0.
-#
-# Modifications:
-# - Added support for xxx.
-# - Fixed a bug in the data xxx.
+
+
 
 import contextlib
 import functools
@@ -1581,8 +1579,9 @@ class GRPOTrainer(Trainer):
         
         logger.debug(
             f"global_step={self.state.global_step}, grpo_iteration={self.grpo_iteration}, mini_batch_step (grad. acc.)={self.mini_batch_step}"
-            f"\n    rewards = {rewards.detach().cpu()}, "
-            f"\n    advantages = {advantages.detach().cpu()}"
+            f"\n    rewards = {rewards.detach().cpu().tolist()}, "
+            # f"\n    advantages = {advantages.detach().cpu().tolist()}"
+            f"\n    advantages = {[round(x, 3) for x in advantages.detach().cpu().tolist()]}"
         )
 
         # print(
@@ -1630,12 +1629,13 @@ class GRPOTrainer(Trainer):
                 #         rewards_to_log,
                 #         self.state.global_step,
                 #     )
-                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                if self.args.report_to and "wandb" in self.args.report_to:
                     import pandas as pd
 
                     # For logging
                     table = {
-                        "step": [self.state.global_step] * len(rewards_to_log),
+                        "global_step": [self.state.global_step] * len(rewards_to_log),
+                        "mini_batch_step": [self.mini_batch_step] * len(rewards_to_log),
                         "prompt": prompts_to_log,
                         "solution": solutions_to_log,
                         "completion": completions_to_log,
@@ -1742,22 +1742,6 @@ class GRPOTrainer(Trainer):
                 loss = self.compute_loss(model, inputs)
             loss = loss.mean().detach()
         return loss, None, None
-        
-    # def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
-    #     mode = "eval" if self.control.should_evaluate else "train"
-    #     metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
-
-    #     # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-    #     # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
-    #     if mode == "eval":
-    #         metrics = {f"eval_{key}": val for key, val in metrics.items()}
-        
-    #     logs = {**logs, **metrics}
-    #     if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
-    #         super().log(logs, start_time)
-    #     else:  # transformers<=4.46
-    #         super().log(logs)
-    #     self._metrics[mode].clear()
     
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
