@@ -6,6 +6,8 @@ import math
 import re
 from typing import Dict
 
+import torch
+
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
@@ -29,55 +31,108 @@ if is_e2b_available():
     load_dotenv()
 
 
+
+# https://github.com/huggingface/trl/blob/v0.15.1/trl/data_utils.py#L24
+def _is_conversational(examples):
+    # examples = [{"role": "user", "content": "What color is the sky?"}]
+    # It must be a list of messages,
+    if isinstance(examples, list):
+        maybe_message = examples[0]
+        # Each message must a list of dictionaries with keys "role" and "content"
+        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
+            return True
+    return False
+
+
 def accuracy_reward(completions, solution, **kwargs):
-    """Reward function that checks if the completion is the same as the ground truth."""
-    contents = [completion[0]["content"] for completion in completions]
+    """
+    Reward function that checks if the completion is the same as the ground truth.
+    
+    Note: `solution` is passed by kwargs (**reward_kwargs) and is a list of solution text.
+        >> keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+        >> reward_kwargs = {key: [example[key] for example in inputs] for key in keys}     # reward_kwargs contains 'solution'
+        >> output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+    
+    math_verify.parser.parse:
+        Ref: 
+            https://github.com/huggingface/Math-Verify/blob/0.5.2/src/math_verify/parser.py#L573
+        
+        Args: 
+            pred (str): The prediction string to parse.
+            extraction_config (Sequence[ExtractionTarget], optional): Configuration for what types of expressions 
+                to extract and how to extract them. Defaults to [LatexExtractionConfig(), ExprExtractionConfig()].
+            
+            extraction_mode (Literal["first_match", "any_match"], optional): Strategy for extracting matches. Defaults to "any_match".
+                - "first_match": Stop after finding the first match
+                - "any_match": Try to extract all possible matches
+    
+    math_verify.grader.verify
+        Verifies if the target expression matches the gold expression using multiple comparison strategies.
+        Ref:
+            https://github.com/huggingface/Math-Verify/blob/0.5.2/src/math_verify/grader.py#L602
+
+        Args:
+             gold: The reference/correct expression(s). Can be:
+                - A single SymPy expression (Basic or MatrixBase)
+                - A string
+                - A list of any of the above
+            target: The expression(s) to verify. Same types as gold.
+            precision: Number of decimal places to consider for numeric comparisons. Defaults to 6.
+
+    """
+    if _is_conversational(completions):
+        completions = [completion["content"] for completion in completions]
     rewards = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
+    for completion_to_parse, gold_to_parse in zip(completions, solution):
+        
+        # Parse gold/ground truth
+        gold_parsed = parse(gold_to_parse)
+        
         if len(gold_parsed) != 0:
+            # Parse completion
+            # Loose mode:
+            completion_parsed = parse(completion_to_parse)
+            
+            # Strict mode:
             # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
+            # answer_parsed = parse(
+            #     completion_to_parse,
+            #     extraction_config=[
+            #         LatexExtractionConfig(
+            #             normalization_config=NormalizationConfig(
+            #                 nits=False,
+            #                 malformed_operators=False,
+            #                 basic_latex=True,
+            #                 equations=True,
+            #                 boxed="all",
+            #                 units=True,
+            #             ),
+            #             # Ensures that boxed is tried first
+            #             boxed_match_priority=0,
+            #             try_extract_without_anchor=False,
+            #         )
+            #     ],
+            #     extraction_mode="first_match",
+            # )
+
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
             try:
-                reward = float(verify(answer_parsed, gold_parsed))
+                reward = float(verify(gold=gold_parsed, target=completion_parsed))
             except Exception as e:
-                print(f"Verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
+                logger.error(f"Verify failed: {e}, completion: {completion_parsed}, gold: {gold_parsed}")
                 reward = 0.0
         else:
-            # If the gold solution is not parseable, 
-            # we reward 1 to skip this example
-            # reward = 1.0
-            # print("Failed to parse gold solution: ", sol)
-            
+            # If the gold solution is not parseable,             
             # we reward 0 to skip this example
             reward = 0.0
-            logger.warning(f"Failed to parse gold solution: {sol}.")
+            logger.error(f"Failed to parse gold solution: {gold_to_parse}.")
         rewards.append(reward)
 
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+
     return rewards
+
 
 
 # def format_reward(completions, **kwargs):
@@ -100,7 +155,7 @@ def format_reward(completions, **kwargs):
     
     rewards = []
     for completion in completions:
-        content = completion[0]["content"]
+        content = completion["content"]
         if re.match(strict_pattern, content, re.DOTALL | re.MULTILINE):
             rewards.append(1.0)     # get full reward
         elif re.match(loose_pattern, content, re.DOTALL | re.MULTILINE):
@@ -128,7 +183,7 @@ def tag_count_reward(completions, **kwargs) -> list[float]:
             count += 0.25
         return count
     
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [completion["content"] for completion in completions]
     return [count_tags(c) for c in contents]
 
 
@@ -148,6 +203,9 @@ def reasoning_steps_reward(completions, **kwargs):
     # Magic number 3 to encourage 3 steps and more, otherwise partial reward
     return [min(1.0, count / 3) for count in matches]
 
+
+
+# TODO: parse and verify needs to be fixed in the following reward functions!
 
 def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
