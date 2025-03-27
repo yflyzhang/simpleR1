@@ -91,7 +91,7 @@ def accuracy_reward(completions, solution, **kwargs):
         if len(gold_parsed) != 0:
             # Parse completion
             # Loose mode:
-            completion_parsed = parse(completion_to_parse)
+            answer_parsed = parse(completion_to_parse)
             
             # Strict mode:
             # We require the answer to be provided in correct latex (no malformed operators)
@@ -117,9 +117,9 @@ def accuracy_reward(completions, solution, **kwargs):
 
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
             try:
-                reward = float(verify(gold=gold_parsed, target=completion_parsed))
+                reward = float(verify(gold=gold_parsed, target=answer_parsed))
             except Exception as e:
-                logger.error(f"Verify failed: {e}, completion: {completion_parsed}, gold: {gold_parsed}")
+                logger.error(f"Verify failed: {e}, completion: {answer_parsed}, gold: {gold_parsed}")
                 reward = 0.0
         else:
             # If the gold solution is not parseable,             
@@ -135,34 +135,37 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 
-# def format_reward(completions, **kwargs):
-#     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-#     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
-#     # pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
-#     completion_contents = [completion[0]["content"] for completion in completions]
-#     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
-#     return [1.0 if match else 0.0 for match in matches]
-
-
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    # pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    # pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
     # Allow `\s`, `\n`, `\t` before `<think>` and after `</answer>`?
-    # Strict pattern: get full reward
-    strict_pattern = r"^[\s]*<think>.*?</think>[\s]*<answer>.*?</answer>[\s]*$"
-    # Loose pattern: get partial reward
-    # loose_pattern = r"^[\s]*<think>.*?</think>.*?<answer>.*?</answer>[\s]*$"
-    loose_pattern = r"<think>.*?</think>.*?<answer>.*?</answer>"
+    pattern = r"^[\s]*<think>.+?</think>[\s]*<answer>.+?</answer>[\s]*$"
+    completion_contents = [completion["content"] for completion in completions]
+    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    return [1.0 if match else 0.0 for match in matches]
+
+
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+#     # Allow `\s`, `\n`, `\t` before `<think>` and after `</answer>`?
+#     # Strict pattern: get full reward
+#     strict_pattern = r"^[\s]*<think>.+?</think>[\s]*<answer>.+?</answer>[\s]*$"
+#     # Loose pattern: get partial reward
+#     loose_pattern = r"^[\s]*<think>.+?</think>.*?<answer>.+?</answer>[\s]*$"
+#     # loose_pattern = r"<think>.+?</think>.*?<answer>.+?</answer>"
     
-    rewards = []
-    for completion in completions:
-        content = completion["content"]
-        if re.match(strict_pattern, content, re.DOTALL | re.MULTILINE):
-            rewards.append(1.0)     # get full reward
-        elif re.match(loose_pattern, content, re.DOTALL | re.MULTILINE):
-            rewards.append(0.5)     # get partial reward (can be set as other values)
-        else:
-            rewards.append(0.0)     # get no reward
-    return rewards
+#     rewards = []
+#     for completion in completions:
+#         content = completion["content"]
+#         # Go strict first
+#         if re.match(strict_pattern, content, re.DOTALL | re.MULTILINE):
+#             rewards.append(1.0)     # get full reward
+#         elif re.match(loose_pattern, content, re.DOTALL | re.MULTILINE):
+#             rewards.append(0.5)     # get partial reward (can be set as other values)
+#         else:
+#             rewards.append(0.0)     # get no reward
+#     return rewards
 
 
 def tag_count_reward(completions, **kwargs) -> list[float]:
@@ -197,7 +200,7 @@ def reasoning_steps_reward(completions, **kwargs):
         First,|Second,|Next,|Finally, - matches transition words
     """
     pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    completion_contents = [completion["content"] for completion in completions]
     matches = [len(re.findall(pattern, content)) for content in completion_contents]
 
     # Magic number 3 to encourage 3 steps and more, otherwise partial reward
@@ -221,7 +224,7 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
         - For correct answers: reward = 0.5 - (len - min_len)/(max_len - min_len)
         - For incorrect answers: reward = min(0, 0.5 - (len - min_len)/(max_len - min_len))
     """
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [completion["content"] for completion in completions]
 
     # First check correctness of answers
     correctness = []
@@ -304,7 +307,7 @@ def get_cosine_scaled_reward(
             max_value_correct: Maximum reward for correct answers
             max_len: Maximum length for scaling
         """
-        contents = [completion[0]["content"] for completion in completions]
+        contents = [completion["content"] for completion in completions]
         rewards = []
 
         for content, sol in zip(contents, solution):
@@ -381,7 +384,7 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
             completions: List of model completions
         """
 
-        contents = [completion[0]["content"] for completion in completions]
+        contents = [completion["content"] for completion in completions]
         rewards = []
         for completion in contents:
             if completion == "":
@@ -483,7 +486,7 @@ def get_code_format_reward(language: str = "python"):
     pattern = rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
 
     def code_format_reward(completions, **kwargs):
-        completion_contents = [completion[0]["content"] for completion in completions]
+        completion_contents = [completion["content"] for completion in completions]
         matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
         return [1.0 if match else 0.0 for match in matches]
 

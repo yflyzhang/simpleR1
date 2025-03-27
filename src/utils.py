@@ -1,5 +1,17 @@
 import os
-from transformers import AutoTokenizer, PreTrainedTokenizer
+import contextlib
+import functools
+import time
+from typing import Generator
+from transformers import (
+    AutoTokenizer, 
+    PreTrainedTokenizer,
+    Trainer, 
+    is_wandb_available
+)
+
+if is_wandb_available():
+    import wandb
 
 
 ##################
@@ -27,8 +39,11 @@ def init_wandb_training(training_args):
 ##################
 DEFAULT_CHAT_TEMPLATE = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
 
+# TODO: revise
 def get_tokenizer(
-    model_args, training_args, auto_set_chat_template: bool = True
+    model_args, 
+    training_args, 
+    auto_set_chat_template: bool = True
 ) -> PreTrainedTokenizer:
     """Get the tokenizer for the model."""
     tokenizer = AutoTokenizer.from_pretrained(
@@ -44,3 +59,71 @@ def get_tokenizer(
     
     return tokenizer
 
+
+
+####################
+# Profiling context
+####################
+@contextlib.contextmanager
+def profiling_context(trainer: Trainer, name: str) -> Generator[None, None, None]:
+    """
+    A context manager function for profiling a block of code. Results are logged to Weights & Biases if enabled.
+
+    Args:
+        trainer (`~transformers.Trainer`):
+            Trainer object.
+        name (`str`):
+            Name of the block to be profiled. Used as a key in the logged dictionary.
+
+    Example:
+    ```python
+    from transformers import Trainer
+    from trl.extras.profiling import profiling_context
+
+    class MyTrainer(Trainer):
+        def some_method(self):
+            A = np.random.rand(1000, 1000)
+            B = np.random.rand(1000, 1000)
+            with profiling_context(self, "matrix_multiplication"):
+                # Code to profile: simulate a computationally expensive operation
+                result = A @ B  # Matrix multiplication
+    ```
+    """
+    start_time = time.perf_counter()
+    yield
+    end_time = time.perf_counter()
+    duration = end_time - start_time
+
+    if "wandb" in trainer.args.report_to and wandb.run is not None and trainer.accelerator.is_main_process:
+        wandb.log({f"profiling/Time taken: {trainer.__class__.__name__}.{name}": duration})
+
+
+def profiling_decorator(func: callable) -> callable:
+    """
+    Decorator to profile a function and log execution time using [`extras.profiling.profiling_context`].
+
+    Args:
+        func (`callable`):
+            Function to be profiled.
+
+    Example:
+    ```python
+    from transformers import Trainer
+    from trl.extras.profiling import profiling_decorator
+
+    class MyTrainer(Trainer):
+        @profiling_decorator
+        def some_method(self):
+            A = np.random.rand(1000, 1000)
+            B = np.random.rand(1000, 1000)
+            # Code to profile: simulate a computationally expensive operation
+            result = A @ B
+    ```
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with profiling_context(self, func.__name__):
+            return func(self, *args, **kwargs)
+
+    return wrapper

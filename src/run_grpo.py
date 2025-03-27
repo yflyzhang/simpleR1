@@ -28,6 +28,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 
+from accelerate.utils import is_peft_model, set_seed
+from trl.models import create_reference_model
 from trl import ModelConfig, TrlParser, get_peft_config
 # from trl import GRPOTrainer
 
@@ -46,8 +48,7 @@ from rewards import (
 )
 
 
-# from utils import get_tokenizer
-from utils import init_wandb_training
+from utils import init_wandb_training, get_tokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -140,7 +141,10 @@ def main():
     # Make sure it's called after data preprocessing
     train_dataset = dataset[split_name]
     if script_args.num_train_samples is not None:
-        num_samples = min(script_args.num_train_samples, len(train_dataset))
+        if script_args.num_train_samples > 0:
+            num_samples = min(script_args.num_train_samples, len(train_dataset))
+        else:
+            num_samples = len(train_dataset)
         sample_ids = random.sample(range(len(train_dataset)), num_samples)
         train_dataset = train_dataset.select(sample_ids)
     
@@ -151,19 +155,8 @@ def main():
     ################
     # Load tokenizer
     ################
-    # tokenizer = get_tokenizer(model_args, training_args)
-    DEFAULT_CHAT_TEMPLATE = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
-    
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-    )
-    
-    if training_args.chat_template is not None:
-        tokenizer.chat_template = training_args.chat_template
-    elif tokenizer.get_chat_template() is None:
-        tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+    # Set tokenizer.chat_template when necessary, see `get_tokenizer` for details.
+    tokenizer = get_tokenizer(model_args, training_args)
     
     # -----------------------------------
     # Add special tokens when necessary?
@@ -225,14 +218,24 @@ def main():
     # Create model
     model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_init_kwargs)
     
+    # Reference model
+    if training_args.beta == 0.0 or is_peft_model(model):
+        # If beta is 0.0, the reference model is not needed
+        # If PEFT is used, the reference model is not needed since the adapter can be disabled
+        # to revert to the initial model.
+        ref_model = None
+    else:
+        # Create a reference model based on the initial model.
+        ref_model = create_reference_model(model)
+    
     # # >>>>> add a breakpoint for debug? <<<<<
     # torch.distributed.breakpoint(rank=0)
     
     # # Resize the model's embedding layer
-    # TODO: vllm read vocab_size from config.json? 
-    # so, reseize token embeddings may induce mismatch on embedding size
     # model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
     # print(f"Updated model token embedding: {model.model.embed_tokens}")
+    # TODO: However, vllm read vocab_size from config.json? 
+    # so, reseize token embeddings may induce mismatch on embedding size
     # A compromise proposal:
     if model.config.vocab_size is not None:
         assert len(tokenizer) <= model.config.vocab_size, "Mismatch: model vocab_size < tokenizer vocab_size"
@@ -243,6 +246,7 @@ def main():
     #############################
     trainer = GRPOTrainer(
         model=model,
+        ref_model=ref_model,
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
         args=training_args,
@@ -282,20 +286,15 @@ def main():
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
-    ##################################
-    # Save model and create model card
-    ##################################
+    #############
+    # Save model
+    #############
     logger.info("*** Save model ***")
     trainer.save_model(training_args.output_dir)
     logger.info(f"Model saved to {training_args.output_dir}")
 
     # Save everything else on main process
-    kwargs = {
-        "dataset_name": script_args.dataset_name,
-        "tags": ["open-r1"],
-    }
     if trainer.accelerator.is_main_process:
-        # trainer.create_model_card(**kwargs)
         # Restore k,v cache for fast inference
         trainer.model.config.use_cache = True
         trainer.model.config.save_pretrained(training_args.output_dir)
@@ -310,13 +309,6 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     
-    # #############
-    # # push to hub
-    # #############
-    # if training_args.push_to_hub:
-    #     logger.info("Pushing to hub...")
-    #     trainer.push_to_hub(**kwargs)
-
 
 if __name__ == "__main__":
     main()

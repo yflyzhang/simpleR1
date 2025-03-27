@@ -1,8 +1,8 @@
 # Train via command line
 
 # model_name_or_path=Qwen/Qwen2.5-1.5B
-# model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
-model_name_or_path=Qwen/Qwen2.5-Math-1.5B
+model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
+# model_name_or_path=Qwen/Qwen2.5-Math-1.5B
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B-Instruct
 # model_name_or_path=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
@@ -34,41 +34,50 @@ echo "[INFO] run name: $run_name"
 echo "[INFO] logs are saved to: $LOG_FILE"
 echo
 
-# sleep 5.1h
+# sleep 3h
 
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
-export CUDA_VISIBLE_DEVICES=0,1,2
+# export CUDA_VISIBLE_DEVICES=0,1,2
+export CUDA_VISIBLE_DEVICES=2
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 
 accelerate launch \
     --main_process_port $MASTER_PORT \
     --config_file configs/accelerate_configs/zero1.yaml \
-    --num_processes=2 \
+    --num_processes=1 \
 src/run_grpo.py \
     --config configs/grpo_config.yaml \
     --output_dir $OUTPUT_DIR \
     --model_name_or_path $model_name_or_path \
     --dataset_name $dataset \
-    --vllm_gpu_memory_utilization 0.75 \
+    --use_vllm True \
+    --vllm_gpu_memory_utilization 0.15 \
     --num_train_epochs 2 \
-    --gradient_accumulation_steps 4 \
-    --per_device_train_batch_size 5 \
-    --num_generations 10 \
-    --num_iterations 4 \
+    --num_generations 16 \
+    --gradient_accumulation_steps 3 \
+    --per_device_train_batch_size 16 \
+    --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --num_train_samples 1000 \
-    --max_completion_length 3200 \
+    --max_completion_length 1024 \
+    --reward_funcs accuracy format tag \
+    --reward_weights 8 1 1 \
+    --scale_rewards False \
+    --epsilon 0.2  \
+    --epsilon_high 0.3 \
     --top_p 1.0 \
     --temperature 1.0 \
-    --beta 0.02 \
-    --learning_rate 1e-4 \
-    --save_strategy epoch \
+    --beta 0.0 \
+    --learning_rate 5e-6 \
+    --save_strategy steps \
     --log_level debug \
-    --seed 95 \
-    --wandb_project simpleR1 \
+    --wandb_project simpleR1-test \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
+    
+
+    # --seed 95 \
     
 

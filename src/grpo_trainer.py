@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional, Sized, Union
 from unittest.mock import patch
 
 
-
+import pandas as pd
 # --------------------------------
 from transformers.trainer import *
 
@@ -63,7 +63,7 @@ from transformers.utils import is_peft_available
 
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from trl.extras.profiling import profiling_context, profiling_decorator
+# from trl.extras.profiling import profiling_context, profiling_decorator
 from trl.import_utils import is_rich_available, is_vllm_available
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.callbacks import SyncRefModelCallback
@@ -76,6 +76,7 @@ from trl.trainer.utils import (
     selective_log_softmax,
 )
 
+from utils import profiling_context, profiling_decorator
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -228,10 +229,10 @@ class GRPOTrainer(Trainer):
 
     def __init__(
         self,
-        model: Union[str, PreTrainedModel],
+        model: Union[PreTrainedModel],
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
         ref_model: Optional[Union[str, PreTrainedModel]] = None,
-        args: Optional[GRPOConfig] = None,
+        args: Union[GRPOConfig] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[PreTrainedTokenizerBase] = None,
@@ -242,38 +243,26 @@ class GRPOTrainer(Trainer):
     ):
         # Args
         if args is None:
-            model_name = model if isinstance(model, str) else model.config._name_or_path
-            model_name = model_name.split("/")[-1]
-            args = GRPOConfig(f"{model_name}-GRPO")
-
+            raise ValueError(f"Invalid args. Expected to be GRPOConfig.")
+        
+        self.beta = args.beta
+        self.ref_model = ref_model
+        
         # Models
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
-        if isinstance(model, str):
-            model_id = model
-            torch_dtype = model_init_kwargs.get("torch_dtype")
-            if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
-                pass  # torch_dtype is already a torch.dtype or "auto" or None
-            elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
-                torch_dtype = getattr(torch, torch_dtype)
-                model_init_kwargs["torch_dtype"] = torch_dtype
-            else:
-                raise ValueError(
-                    "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
-                    f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
-                )
-            # Disable caching if gradient checkpointing is enabled (not supported)
-            model_init_kwargs["use_cache"] = (
-                False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+        if not isinstance(model, PreTrainedModel):
+            raise ValueError(
+                f"Invalid type. Expected to be type of 'PreTrainedModel', but got {type(model)}."
             )
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
-        else:
-            model_id = model.config._name_or_path
-            # if args.model_init_kwargs is not None:    # TODO: check this
-            #     raise ValueError(
-            #         "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
-            #         "This argument can only be used when the `model` argument is a string."
-            #     )
+        
+        # TODO: for what?
+        model_id = model.config._name_or_path
+        # if args.model_init_kwargs is not None:    # TODO: check this
+        #     raise ValueError(
+        #         "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+        #         "This argument can only be used when the `model` argument is a string."
+        #     )
 
         if peft_config is not None:
             if not is_peft_available():
@@ -284,20 +273,16 @@ class GRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        # Reference model
-        self.beta = args.beta
-        if self.beta == 0.0:
-            # If beta is 0.0, the reference model is not needed
-            self.ref_model = None
-        elif is_deepspeed_zero3_enabled():
-            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
-        elif is_peft_model(model):
-            # If PEFT is used, the reference model is not needed since the adapter can be disabled
-            # to revert to the initial model.
-            self.ref_model = None
-        else:
-            # If PEFT configuration is not provided, create a reference model based on the initial model.
-            self.ref_model = create_reference_model(model)
+        # # Reference model
+        # self.beta = args.beta
+        # if self.beta == 0.0 or is_peft_model(model):
+        #     # If beta is 0.0, the reference model is not needed
+        #     # If PEFT is used, the reference model is not needed since the adapter can be disabled
+        #     # to revert to the initial model.
+        #     self.ref_model = None
+        # else:
+        #     # Create a reference model based on the initial model.
+        #     self.ref_model = create_reference_model(model)
         
         # Disable dropout in the model?
         # Note: Qwen 2.5 and Llama 3.2 didn't use dropout.
@@ -368,8 +353,14 @@ class GRPOTrainer(Trainer):
         # --------------------------
         self.grpo_iteration = None                  # tracks current grpo iteration
         self.mini_batch_step = None                 # tracks mini-batch step
+        # Buffer to store completion and score tables for wandb log use
+        self._buffered_tables = [None] * args.gradient_accumulation_steps
+        
+        # Clip higher
+        self.epsilon = args.epsilon                 # clip value (pi_theta/pi_old)
+        self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # --------------------------
-        self.epsilon = args.epsilon
+        
         # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle.
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
@@ -497,7 +488,7 @@ class GRPOTrainer(Trainer):
                         model=model.name_or_path,
                         device=vllm_device,
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                        dtype=self.args.vllm_dtype,
+                        # dtype=self.args.vllm_dtype,
                         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
                         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
                         # This is particularly useful here because we generate completions from the same prompts.
@@ -587,11 +578,11 @@ class GRPOTrainer(Trainer):
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
         
-        # In the following figure, the values are the prompt indices. The first row shows the first sampled batch, the
-        # second row shows the second sampled batch, and so on.
+        # In the following figure, the values are the prompt indices. The first row shows the first sampled mini-batch, 
+        # the second row shows the second sampled mini-batch, and so on.
         #
         #                                                 |     GPU 0     |     GPU 1     |     GPU 2    |
-        #
+        #                            grpo
         #            global_step   iteration   mini-batch   <───────>  num_generations=3
         #                                                   <───────────> per_device_train_batch_size=4
         #                ▲   0          0          1        0   0   0   1   1   1   2   2   2   3   3   3  │
@@ -1133,7 +1124,11 @@ class GRPOTrainer(Trainer):
                         self.current_flos += float(self.floating_point_ops(inputs))
 
                         if do_sync_step:
-                            logger.debug(f"Update model parameters: global_step={self.state.global_step}, grpo_iteration={self.grpo_iteration}, mini_batch_step (grad. acc.)={self.mini_batch_step}")
+                            logger.debug(
+                                f"optimizer.step: "
+                                f"grpo_iteration={self.grpo_iteration+1}"
+                                # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"
+                            )
                             # Since we perform prefetching, we need to manually set sync_gradients to True
                             self.accelerator.gradient_state._set_sync_gradients(True)
 
@@ -1203,7 +1198,7 @@ class GRPOTrainer(Trainer):
                     if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         self.lr_scheduler.step()
                 
-                # if do_sync_step:
+                # if do_sync_step:  # After each batched samples, `do_sync_step` is True.
                 self.state.global_step += 1
                 # self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                 self.state.epoch = epoch + (step + 1 + steps_skipped) / self.num_iterations / steps_in_epoch
@@ -1409,7 +1404,8 @@ class GRPOTrainer(Trainer):
     
 
     def _generate_and_score_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
+        self, 
+        inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
@@ -1427,6 +1423,11 @@ class GRPOTrainer(Trainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+        
+        # TODO: Add over-sampling to enhance the diversity of generations
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
@@ -1453,14 +1454,12 @@ class GRPOTrainer(Trainer):
                         completion_ids.append(output.token_ids)
             else:
                 completion_ids = [None] * len(all_prompts_text)
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its
-            # corresponding slice.
+            # Broadcast the completions from the main process to all processes, 
+            # ensuring each process receives its corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            completion_ids = completion_ids[process_slice]
+            # Keep only the local part of the data
+            start = self.accelerator.process_index * len(prompts)
+            completion_ids = completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1518,7 +1517,8 @@ class GRPOTrainer(Trainer):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+                # completions.append([{"role": "assistant", "content": bootstrap + completion}])
+                completions.append({"role": "assistant", "content": bootstrap + completion})
         else:
             completions = completions_text
 
@@ -1548,7 +1548,7 @@ class GRPOTrainer(Trainer):
                 else:
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}     # reward_kwargs contains 'solution'
                     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
             
@@ -1568,30 +1568,23 @@ class GRPOTrainer(Trainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-8)
+        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages = rewards - mean_grouped_rewards
+        if self.args.scale_rewards:
+            advantages = advantages / (std_grouped_rewards + 1e-4)
         
         # # Use tanh?
         # scaled_rewards = 2*rewards/self.reward_weights.sum() - 1
         # advantages = torch.tanh(scaled_rewards)
 
         # Shift mean? TODO: test if it works?
-        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-8) + mean_grouped_rewards/5.0
+        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4) + mean_grouped_rewards/5.0
         
         logger.debug(
-            f"global_step={self.state.global_step}, grpo_iteration={self.grpo_iteration}, mini_batch_step (grad. acc.)={self.mini_batch_step}"
-            f"\n    rewards = {rewards.detach().cpu().tolist()}, "
-            # f"\n    advantages = {advantages.detach().cpu().tolist()}"
-            f"\n    advantages = {[round(x, 3) for x in advantages.detach().cpu().tolist()]}"
+            f"\n  global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch (grad. acc.)={self.mini_batch_step+1}"
+            f"\n  rewards = {rewards.detach().cpu().tolist()}, "
+            f"\n  advantages = {[round(x, 3) for x in advantages.detach().cpu().tolist()]}"
         )
-
-        # print(
-        #     f"[Rank {self.args.process_index}], global_step={self.state.global_step}, "
-        #     f"\n    rewards = {rewards.detach().cpu()}, "
-        #     f"\n    advantages = {advantages.detach().cpu()}"
-        # )
-        
-        # # >>>>> add a breakpoint for debug? <<<<<
-        # torch.distributed.breakpoint(rank=0)
 
         # Keep only the local part of the data
         start = self.accelerator.process_index * len(prompts)
@@ -1611,8 +1604,8 @@ class GRPOTrainer(Trainer):
             else:
                 reward_func_name = reward_func.__name__
             self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
-
-        self._metrics[mode]["reward"].append(rewards.mean().item())
+        
+        self._metrics[mode]["reward"].append(rewards.mean().item())     # append all mini-batch samples
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
@@ -1630,19 +1623,19 @@ class GRPOTrainer(Trainer):
                 #         self.state.global_step,
                 #     )
                 if self.args.report_to and "wandb" in self.args.report_to:
-                    import pandas as pd
-
                     # For logging
                     table = {
-                        "global_step": [self.state.global_step] * len(rewards_to_log),
-                        "mini_batch_step": [self.mini_batch_step] * len(rewards_to_log),
+                        "global_step": [self.state.global_step+1] * len(rewards_to_log),
+                        "mini_batch": [self.mini_batch_step+1] * len(rewards_to_log),
                         "prompt": prompts_to_log,
                         "solution": solutions_to_log,
                         "completion": completions_to_log,
                         "reward": rewards_to_log,
                     }
-                    df = pd.DataFrame(table)
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+                    self._buffered_tables[self.mini_batch_step] = table
+
+                    # df = pd.DataFrame(table)
+                    # wandb.log({"completions": wandb.Table(dataframe=df)})
 
         return {
             "prompt_ids": prompt_ids,
@@ -1697,19 +1690,26 @@ class GRPOTrainer(Trainer):
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        # coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        # Clip higher to promote diversity and precent entropy collapse (ref: DAPO)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon_high)
         per_token_adv1 = coef_1 * advantages.unsqueeze(1)
         per_token_adv2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_adv1, per_token_adv2)
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
         
-        # prevent negative loss?
-        # loss = torch.relu(per_token_loss * completion_mask).sum() / completion_mask.sum()
-        # max((per_token_loss * completion_mask).sum() / completion_mask.sum(), 0)
-        
+        # Token-level loss:
+        # Longer sequences can have more influence on the overall gradient update, 
+        # but particular generation pattern may help to train the model regardless of the response length.
+        # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+
         # ---------------------------------
+        # Remove length bias by using masked_sum with a constant normalizer (ref: Dr. GRPO)
+        loss = (per_token_loss * completion_mask).sum() / self.max_completion_length
+
+        # Sequence-level loss: 
+        # Each sequence has an equal weight in the final loss computation
         # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         
         # # Test hinge loss?
@@ -1725,18 +1725,19 @@ class GRPOTrainer(Trainer):
         if self.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
-
-        is_clipped = (coef_1 < coef_2).float()
+        
+        # is_clipped = (coef_1 < (1 - self.epsilon)) | (coef_1 > (1 + self.epsilon))
+        is_clipped = (coef_1 < (1 - self.epsilon)) | (coef_1 > (1 + self.epsilon_high))
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
     
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-        # ========================================
+        # ----------------------------------------
         # Prepare grpo inputs: generate and score the completions
         inputs = self.prepare_grpo_inputs(inputs)
-        # ========================================
+        # ----------------------------------------
         with torch.no_grad():
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
@@ -1750,12 +1751,17 @@ class GRPOTrainer(Trainer):
 
         Subclass and override this method to inject custom behavior.
 
+        Note: 
+            Log in rank 0 only! CallbackHandler will do it for you.
+            `if state.is_world_process_zero`
+
         Args:
             logs (`Dict[str, float]`):
                 The values to log.
             start_time (`Optional[float]`):
                 The start of training.
         """
+        
         if self.state.epoch is not None:
             logs["epoch"] = self.state.epoch
         if self.args.include_num_input_tokens_seen:
@@ -1764,10 +1770,17 @@ class GRPOTrainer(Trainer):
                 speed_metrics("train", start_time, num_tokens=self.state.num_input_tokens_seen)
         
         # ------------------------------------
-        if self.state.global_step is not None:
-            logs["global_step"] = self.state.global_step
+        # if self.state.global_step is not None:
+        #     logs["global_step"] = self.state.global_step
+        # TODO： check if `WandbCallback` will add `global_step` by default
+        # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L976
         
-        # grpo logs
+
+        # # TODO: check if we should log only in main process
+        # if not self.accelerator.is_main_process:
+        #     return
+        
+        # Log grpo train/eval metrics
         mode = "eval" if self.control.should_evaluate else "train"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -1776,17 +1789,39 @@ class GRPOTrainer(Trainer):
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
         
+        # Log completion and score tables in main process
+        if self.accelerator.is_main_process and self.args.report_to and "wandb" in self.args.report_to:
+            # Number of valid mini-batch tables for current batch
+            num_valid_tables = self.mini_batch_step + 1
+            # Convert each dictionary in _buffered_tables to a DataFrame and concatenate them
+            df = pd.concat(
+                [pd.DataFrame(d) for d in self._buffered_tables[:num_valid_tables]], 
+                ignore_index=True
+            )
+            wandb.log({"completions": wandb.Table(dataframe=df)})
+        
         # logs = {**logs, **metrics}      # raw logs + grpo metrics
         output = {**logs, **metrics}   # raw logs + grpo metrics
-        
-        self._metrics[mode].clear()
-        # ------------------------------------
-        
-        # output = {**logs, **{"step": self.state.global_step}}
 
+        self._metrics[mode].clear()
+        
         self.state.log_history.append(output)
-        # self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, output)
+        # self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+        
+        # Ref: 
+        # 1. CallbackHandler.on_log
+        #   self.call_event("on_log", args, state, control, logs=logs)
+        #   https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L555
+        # 2. `ProgressCallback.on_log`
+        #   def on_log(self, args, state, control, logs=None, **kwargs):
+        #   https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L677
+        # 3. `WandbCallback.on_log`
+        #   def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        #   https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
+        
+        # ------------------------------------
+
         
     # Overwrite `set_initial_training_values` as it's not accurate in estimating: 
     # - num_update_steps_per_epoch
