@@ -52,12 +52,12 @@ class ScriptArguments:
         },
     )
 
-    num_train_samples: int = field(
+    max_num_train_samples: int = field(
         default=-1,
         metadata={"help": "Max number of samples used for training."},
     )
     
-    num_test_samples: int = field(
+    max_num_test_samples: int = field(
         default=None,
         metadata={"help": "Max number of samples used for test."},
     )
@@ -329,6 +329,12 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
     )
+
+    num_generation_attempts: int = field(
+        default=10,
+        metadata={"help": "Max number of attempts per prompt in model generation."},
+    )
+    
     epsilon: float = field(
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
@@ -367,6 +373,12 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
+
+    compute_kl: bool = field(
+        default=False, 
+        metadata={"help": "Whether to compute kl even when beta=0. This helps to monitor model update."}
+    )
+
 
 
 
@@ -493,7 +505,10 @@ class SFTArguments(TrainingArguments):
     # Template
     chat_template: Optional[str] = field(
         default=None, 
-        metadata={"help": "The chat template to use."}
+        metadata={
+            "help": "The chat template to use."
+                    "Will override the default chat_template of tokenizer!"
+        }
     )
     system_prompt: Optional[str] = field(
         default=None,

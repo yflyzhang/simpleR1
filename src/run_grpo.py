@@ -104,14 +104,14 @@ def main():
     # if 'problem' in columns and 'solution' in columns:
     if 'problem' not in columns:
         for feture in columns:
-            if feture.lower() in ['problem', 'question']:
+            if feture.lower() in ['problem', 'question', 'query']:
                 dataset = dataset.rename_column(feture, 'problem')
                 break
         else:
             raise ValueError("no column named 'problem' in the datset!")
     if 'solution' not in columns:
         for feture in columns:
-            if feture.lower() in ['solution', 'answer']:
+            if feture.lower() in ['solution', 'answer', 'response']:
                 dataset = dataset.rename_column(feture, 'solution')
                 break
         else:
@@ -140,9 +140,9 @@ def main():
     # Use a small set for fast check
     # Make sure it's called after data preprocessing
     train_dataset = dataset[split_name]
-    if script_args.num_train_samples is not None:
-        if script_args.num_train_samples > 0:
-            num_samples = min(script_args.num_train_samples, len(train_dataset))
+    if script_args.max_num_train_samples is not None:
+        if script_args.max_num_train_samples > 0:
+            num_samples = min(script_args.max_num_train_samples, len(train_dataset))
         else:
             num_samples = len(train_dataset)
         sample_ids = random.sample(range(len(train_dataset)), num_samples)
@@ -219,7 +219,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_init_kwargs)
     
     # Reference model
-    if training_args.beta == 0.0 or is_peft_model(model):
+    if (training_args.beta == 0.0 and not training_args.compute_kl) or is_peft_model(model):
         # If beta is 0.0, the reference model is not needed
         # If PEFT is used, the reference model is not needed since the adapter can be disabled
         # to revert to the initial model.
@@ -234,8 +234,11 @@ def main():
     # # Resize the model's embedding layer
     # model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
     # print(f"Updated model token embedding: {model.model.embed_tokens}")
-    # TODO: However, vllm read vocab_size from config.json? 
-    # so, reseize token embeddings may induce mismatch on embedding size
+    # TODO: 
+    # However, vllm load model and tokenize from model config (model: str,),
+    # https://github.com/vllm-project/vllm/blob/v0.7.2/vllm/entrypoints/llm.py#L157
+    # so, resize token embeddings may induce mismatch on embedding size between the reseized one and vllm loaded one
+    # https://github.com/vllm-project/vllm/issues/5203
     # A compromise proposal:
     if model.config.vocab_size is not None:
         assert len(tokenizer) <= model.config.vocab_size, "Mismatch: model vocab_size < tokenizer vocab_size"

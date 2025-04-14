@@ -142,7 +142,10 @@ def format_reward(completions, **kwargs):
     # Allow `\s`, `\n`, `\t` before `<think>` and after `</answer>`?
     pattern = r"^[\s]*<think>.+?</think>[\s]*<answer>.+?</answer>[\s]*$"
     completion_contents = [completion["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    # Multiline mode:  `$`` may match the end of each line instead of the end of the entire string
+    # matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    # Match the end of the entire string instead of the end of each line
+    matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 

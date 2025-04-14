@@ -247,6 +247,10 @@ class GRPOTrainer(Trainer):
         
         self.beta = args.beta
         self.ref_model = ref_model
+
+        self.compute_kl = args.compute_kl   # compute kl even when beta=0 (helps to monitor model update)
+        if args.beta > 0:                   # have to compute kl when beta > 0
+            self.compute_kl = True
         
         # Models
         # Trained model
@@ -256,13 +260,6 @@ class GRPOTrainer(Trainer):
                 f"Invalid type. Expected to be type of 'PreTrainedModel', but got {type(model)}."
             )
         
-        # TODO: for what?
-        model_id = model.config._name_or_path
-        # if args.model_init_kwargs is not None:    # TODO: check this
-        #     raise ValueError(
-        #         "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
-        #         "This argument can only be used when the `model` argument is a string."
-        #     )
 
         if peft_config is not None:
             if not is_peft_available():
@@ -272,17 +269,6 @@ class GRPOTrainer(Trainer):
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
-
-        # # Reference model
-        # self.beta = args.beta
-        # if self.beta == 0.0 or is_peft_model(model):
-        #     # If beta is 0.0, the reference model is not needed
-        #     # If PEFT is used, the reference model is not needed since the adapter can be disabled
-        #     # to revert to the initial model.
-        #     self.ref_model = None
-        # else:
-        #     # Create a reference model based on the initial model.
-        #     self.ref_model = create_reference_model(model)
         
         # Disable dropout in the model?
         # Note: Qwen 2.5 and Llama 3.2 didn't use dropout.
@@ -293,6 +279,9 @@ class GRPOTrainer(Trainer):
         
         # Processing class
         if processing_class is None:
+            logger.warning(
+                f"`processing_class` is not defined, will load tokenizer from `{model.config._name_or_path}` by default."
+            )
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
         
         # Reward functions
@@ -353,6 +342,7 @@ class GRPOTrainer(Trainer):
         # --------------------------
         self.grpo_iteration = None                  # tracks current grpo iteration
         self.mini_batch_step = None                 # tracks mini-batch step
+        self.num_generation_attempts = args.num_generation_attempts # max number of generation attempts
         # Buffer to store completion and score tables for wandb log use
         self._buffered_tables = [None] * args.gradient_accumulation_steps
         
@@ -424,7 +414,7 @@ class GRPOTrainer(Trainer):
             if not is_vllm_available():
                 raise ImportError(
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
-                    "`pip install vllm` to use it."
+                    "`pip install vllm==xxx` to use it."
                 )
 
             if self.accelerator.is_main_process:
@@ -433,7 +423,7 @@ class GRPOTrainer(Trainer):
                 device_module = getattr(torch, device_type)
                 if vllm_device == "auto":
                     if device_module.device_count() == 1:
-                        vllm_device = f"{device_type}:0"  # particular case when training with onyl 1 device: share it
+                        vllm_device = f"{device_type}:0"  # particular case when training with only 1 device: share it
                     else:
                         vllm_device = f"{device_type}:{self.accelerator.num_processes}"  # take the next GPU idx
                 
@@ -652,6 +642,10 @@ class GRPOTrainer(Trainer):
                 }
             else:
                 state_dict = unwrapped_model.state_dict()
+            
+            # # >>>>> add a breakpoint for debug? <<<<<
+            # torch.distributed.breakpoint(rank=0)
+
             if self.accelerator.is_main_process:
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights(state_dict.items())
@@ -1039,6 +1033,7 @@ class GRPOTrainer(Trainer):
             remainder = len_dataloader % args.gradient_accumulation_steps
             num_mini_batches = args.gradient_accumulation_steps
             for update_step in range(num_update_steps_per_epoch):
+                # One batch sample
                 if update_step == num_update_steps_per_epoch - 1 and remainder != 0:
                     num_mini_batches = remainder
                 
@@ -1381,6 +1376,21 @@ class GRPOTrainer(Trainer):
 
             return loss.detach()
     
+
+    def check_model_generation(self, inputs):
+        """# Check if current model generation is good enough"""
+
+        # Check reward
+        rewards = inputs['rewards'].tolist()
+        # Make sure the generated sentences are diverse and contain positive samples
+        if max(rewards) != sum(self.reward_weights.tolist()) or len(set(rewards)) == 1:
+            return False
+        
+        # TODO: 
+        # check other conditions, e.g., entropy
+        
+        return True
+    
     
     @profiling_decorator
     def prepare_grpo_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1391,22 +1401,41 @@ class GRPOTrainer(Trainer):
         if mode == "train":
             # if self.state.global_step % self.num_iterations == 0:
             if self.grpo_iteration == 0:
-                # Generate and score completions in grpo_iteration=0, and reuse them for 1~num_iterations iterations
-                inputs = self._generate_and_score_completions(inputs)
-                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
+                # Generate and score completions in grpo_iteration=0, and reuse them for grpo_iteration=[1, num_iterations-1]
+                
+                # Rejection sampling for model generation
+                max_attempts = self.num_generation_attempts # maximum number of generation attempts
+                for attempt in range(max_attempts):
+                    grpo_inputs = self._generate_and_score_completions(inputs)
+
+                    # # >>>>> add a breakpoint for debug? <<<<<
+                    # torch.distributed.breakpoint(rank=0)
+
+                    # Check if current model generation is good enough?
+                    if self.check_model_generation(grpo_inputs):
+                        logger.critical(f"[attempt={attempt+1}]: Current model generation is good!")
+                        break
+                    else:
+                        logger.warning(f"[attempt={attempt+1}]: Model generation is not good, try again...")
+                else:
+                    # Not good (break is not invoked), but max_attempts reached
+                    logger.warning(f"[attempt={attempt+1}]: Model generation is not good, but max_attempts reached!")
+                
+                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = grpo_inputs
             else:
-                inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+                grpo_inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
             self._step += 1
         else:
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            inputs = self._generate_and_score_completions(inputs)
-        return inputs
+            grpo_inputs = self._generate_and_score_completions(inputs)
+        return grpo_inputs
     
 
     def _generate_and_score_completions(
         self, 
         inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         solutions_text = [x["solution"] for x in inputs]
@@ -1426,8 +1455,6 @@ class GRPOTrainer(Trainer):
 
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
-        
-        # TODO: Add over-sampling to enhance the diversity of generations
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
@@ -1448,18 +1475,18 @@ class GRPOTrainer(Trainer):
                     all_outputs = self.llm.generate(
                         ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
                     )
-                completion_ids = []
+                all_completion_ids = []
                 for outputs in all_outputs:
                     for output in outputs.outputs:
-                        completion_ids.append(output.token_ids)
+                        all_completion_ids.append(output.token_ids)
             else:
-                completion_ids = [None] * len(all_prompts_text)
+                all_completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, 
             # ensuring each process receives its corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
             # Keep only the local part of the data
             start = self.accelerator.process_index * len(prompts)
-            completion_ids = completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
+            completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1499,9 +1526,9 @@ class GRPOTrainer(Trainer):
             else:
                 old_per_token_logps = None
 
-            if self.beta == 0.0:
+            if not self.compute_kl:
                 ref_per_token_logps = None
-            elif self.ref_model is not None:
+            elif self.ref_model is not None:    # compute kl even when beta=0, to monitor model update
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
@@ -1636,7 +1663,7 @@ class GRPOTrainer(Trainer):
 
                     # df = pd.DataFrame(table)
                     # wandb.log({"completions": wandb.Table(dataframe=df)})
-
+        
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1644,6 +1671,7 @@ class GRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
+            "rewards": rewards,
             "advantages": advantages,
         }
     
@@ -1678,7 +1706,7 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
+        if self.compute_kl:
             ref_per_token_logps = inputs["ref_per_token_logps"]
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
@@ -1696,8 +1724,8 @@ class GRPOTrainer(Trainer):
         per_token_adv1 = coef_1 * advantages.unsqueeze(1)
         per_token_adv2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_adv1, per_token_adv2)
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
+        if self.beta > 0.0:    # add kl loss when beta>0
+            per_token_loss += self.beta * per_token_kl
         
         # Token-level loss:
         # Longer sequences can have more influence on the overall gradient update, 
@@ -1721,8 +1749,9 @@ class GRPOTrainer(Trainer):
         
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
-
-        if self.beta != 0.0:
+        
+        # Compute kl even when beta=0, to monitor model update
+        if self.compute_kl:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
         
