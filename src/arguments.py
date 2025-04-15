@@ -379,6 +379,15 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         metadata={"help": "Whether to compute kl even when beta=0. This helps to monitor model update."}
     )
 
+    mask_truncated_completions: bool = field(
+        default=False,
+        metadata={
+            "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
+            "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "
+            "a good practice for training stability."
+        },
+    )
+
 
 
 

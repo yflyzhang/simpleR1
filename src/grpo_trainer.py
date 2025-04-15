@@ -342,9 +342,11 @@ class GRPOTrainer(Trainer):
         # --------------------------
         self.grpo_iteration = None                  # tracks current grpo iteration
         self.mini_batch_step = None                 # tracks mini-batch step
-        self.num_generation_attempts = args.num_generation_attempts # max number of generation attempts
-        # Buffer to store completion and score tables for wandb log use
-        self._buffered_tables = [None] * args.gradient_accumulation_steps
+        self.num_generation_attempts = args.num_generation_attempts         # max number of generation attempts
+        self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
+        self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
+        # Completion examples (i.e., prompt + solution + score) for wandb log
+        self.completion_examples = []
         
         # Clip higher
         self.epsilon = args.epsilon                 # clip value (pi_theta/pi_old)
@@ -1378,7 +1380,9 @@ class GRPOTrainer(Trainer):
     
 
     def check_model_generation(self, inputs):
-        """# Check if current model generation is good enough"""
+        """
+        Check if current generation meets specific criterion(s)
+        """
 
         # Check reward
         rewards = inputs['rewards'].tolist()
@@ -1387,7 +1391,7 @@ class GRPOTrainer(Trainer):
             return False
         
         # TODO: 
-        # check other conditions, e.g., entropy
+        # Check other conditions, e.g., entropy
         
         return True
     
@@ -1406,34 +1410,35 @@ class GRPOTrainer(Trainer):
                 # Rejection sampling for model generation
                 max_attempts = self.num_generation_attempts # maximum number of generation attempts
                 for attempt in range(max_attempts):
-                    grpo_inputs = self._generate_and_score_completions(inputs)
+                    grpo_inputs = self._generate_and_score_completions(inputs, attempt=attempt)
 
-                    # # >>>>> add a breakpoint for debug? <<<<<
-                    # torch.distributed.breakpoint(rank=0)
-
-                    # Check if current model generation is good enough?
+                    # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
-                        logger.critical(f"[attempt={attempt+1}]: Current model generation is good!")
+                        logger.debug(f"[attempt={attempt+1}]: Current model generation is good.")
                         break
+                    elif attempt == max_attempts-1:
+                        logger.warning(f"[attempt={attempt+1}]: Current model generation is not good, but max_attempts reached!")
                     else:
-                        logger.warning(f"[attempt={attempt+1}]: Model generation is not good, try again...")
-                else:
-                    # Not good (break is not invoked), but max_attempts reached
-                    logger.warning(f"[attempt={attempt+1}]: Model generation is not good, but max_attempts reached!")
+                        logger.warning(f"[attempt={attempt+1}]: Current model generation is not good, try again...")
+                    
+                    # # >>>>> add a breakpoint for debug? <<<<<
+                    # torch.distributed.breakpoint(rank=0)                    
                 
                 self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = grpo_inputs
             else:
                 grpo_inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
             self._step += 1
+
         else:
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            grpo_inputs = self._generate_and_score_completions(inputs)
+            grpo_inputs = self._generate_and_score_completions(inputs, attempt=0)
         return grpo_inputs
     
-
+    
     def _generate_and_score_completions(
         self, 
-        inputs: dict[str, Union[torch.Tensor, Any]]
+        inputs: dict[str, Union[torch.Tensor, Any]],
+        attempt: int,
     ) -> dict[str, Union[torch.Tensor, Any]]:
         
         device = self.accelerator.device
@@ -1457,7 +1462,7 @@ class GRPOTrainer(Trainer):
         # torch.distributed.breakpoint(rank=0)
 
         # Generate completions using either vLLM or regular generation
-        if self.args.use_vllm:
+        if self.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
@@ -1476,17 +1481,25 @@ class GRPOTrainer(Trainer):
                         ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
                     )
                 all_completion_ids = []
+                all_completion_texts = []
                 for outputs in all_outputs:
                     for output in outputs.outputs:
                         all_completion_ids.append(output.token_ids)
+                        all_completion_texts.append(output.text)
+
             else:
                 all_completion_ids = [None] * len(all_prompts_text)
+                all_completion_texts = [None] * len(all_prompts_text)
+            
             # Broadcast the completions from the main process to all processes, 
             # ensuring each process receives its corresponding slice.
             all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
+            all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
+            
             # Keep only the local part of the data
             start = self.accelerator.process_index * len(prompts)
             completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
+            completions_text = all_completion_texts[start:start+len(prompts)]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1503,6 +1516,9 @@ class GRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+
+            # Decode the generated completions
+            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -1511,11 +1527,13 @@ class GRPOTrainer(Trainer):
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
         
+        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+        if self.mask_truncated_completions:
+            completion_mask = completion_mask * is_eos.any(dim=1).unsqueeze(1).int()
+        
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-        
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
@@ -1537,9 +1555,9 @@ class GRPOTrainer(Trainer):
                     ref_per_token_logps = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
-
-        # Decode the generated completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        
+        # Process the generated completions
+        # completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
@@ -1548,7 +1566,8 @@ class GRPOTrainer(Trainer):
                 completions.append({"role": "assistant", "content": bootstrap + completion})
         else:
             completions = completions_text
-
+        
+        # Rewards
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
@@ -1583,96 +1602,110 @@ class GRPOTrainer(Trainer):
         
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        rewards_per_func = gather(rewards_per_func)     # gather from all devices
 
         # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        all_rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        
+        # TODO: whether to mask the rewards for mask_truncated_completions,
+        # as it affects the compute of advantages.
+        # all_rewards = all_rewards * is_eos.any(dim=1).int()
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        mean_grouped_rewards = all_rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = all_rewards.view(-1, self.num_generations).std(dim=1)
 
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        advantages = rewards - mean_grouped_rewards
-        if self.args.scale_rewards:
+        advantages = all_rewards - mean_grouped_rewards
+        if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
         
-        # # Use tanh?
-        # scaled_rewards = 2*rewards/self.reward_weights.sum() - 1
-        # advantages = torch.tanh(scaled_rewards)
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
 
-        # Shift mean? TODO: test if it works?
-        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4) + mean_grouped_rewards/5.0
+
+        # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+        # Only log the first attempt (may change to other values accordingly)
+        if attempt == 0:
+
+            # log completion length (including truncated completions): mean, min, max
+            all_eos_idx = gather(eos_idx)
+            all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
+            # raw_completion_length = (sequence_indices <= eos_idx.unsqueeze(1)).int().sum(1)
+            # all_completions_length = gather(raw_completion_length)
+            self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
+            self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
+            self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
+            
+            # identify the ratio of truncated sequences (completions without EOS)
+            # i.e., `eos_idx` is equal to `max_completion_length`
+            num_truncated = (all_eos_idx == self.max_completion_length).int().sum().item()
+            self._metrics[mode]["completions/truncated_ratio"].append(num_truncated/len(all_completions_length))
+            
+            # log combined reward (e.g., accuracy reward + format reward)
+            self._metrics[mode]["reward"].append(all_rewards.mean().item())     # append all mini-batch samples
+            self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+            # log each specific reward (e.g., 1. accuracy reward; 2. format reward)
+            reward_per_func = rewards_per_func.mean(0)
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+            
+            # Log completion examples
+            if (
+                self.accelerator.is_main_process and
+                self.log_completions and 
+                self.state.global_step % self.args.logging_steps == 0 and
+                self.args.report_to and "wandb" in self.args.report_to
+            ):
+                prompts_to_log = gather_object(prompts_text)
+                completions_to_log = gather_object(completions_text)
+                solutions_to_log = gather_object(solutions_text)
+                rewards_to_log = all_rewards.tolist()
+
+                # Completion table to be logged later
+                completion_table = {
+                    "global_step": [self.state.global_step+1] * len(rewards_to_log),
+                    "mini_batch": [self.mini_batch_step+1] * len(rewards_to_log),
+                    "prompt": prompts_to_log,
+                    "solution": solutions_to_log,
+                    "completion": completions_to_log,
+                    "reward": rewards_to_log,
+                }
+                self.completion_examples.append(completion_table)
         
+
+        # Print reward info from all devices
         logger.debug(
             f"\n  global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch (grad. acc.)={self.mini_batch_step+1}"
-            f"\n  rewards = {rewards.detach().cpu().tolist()}, "
+            f"\n  rewards = {all_rewards.detach().cpu().tolist()}, "
             f"\n  advantages = {[round(x, 3) for x in advantages.detach().cpu().tolist()]}"
         )
 
         # Keep only the local part of the data
         start = self.accelerator.process_index * len(prompts)
         advantages = advantages[start:start+len(prompts)]      # [i:i+len(prompts)]
-
-        
-        # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
-
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-        self._metrics[mode]["completion_length"].append(completion_length)
-
-        reward_per_func = rewards_per_func.mean(0)
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-            else:
-                reward_func_name = reward_func.__name__
-            self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
-        
-        self._metrics[mode]["reward"].append(rewards.mean().item())     # append all mini-batch samples
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
-
-        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
-            prompts_to_log = gather_object(prompts_text)
-            completions_to_log = gather_object(completions_text)
-            solutions_to_log = gather_object(solutions_text)
-            rewards_to_log = rewards.tolist()
-
-            if self.accelerator.is_main_process:
-                # if is_rich_available():
-                #     print_prompt_completions_sample(
-                #         prompts_to_log,
-                #         completions_to_log,
-                #         rewards_to_log,
-                #         self.state.global_step,
-                #     )
-                if self.args.report_to and "wandb" in self.args.report_to:
-                    # For logging
-                    table = {
-                        "global_step": [self.state.global_step+1] * len(rewards_to_log),
-                        "mini_batch": [self.mini_batch_step+1] * len(rewards_to_log),
-                        "prompt": prompts_to_log,
-                        "solution": solutions_to_log,
-                        "completion": completions_to_log,
-                        "reward": rewards_to_log,
-                    }
-                    self._buffered_tables[self.mini_batch_step] = table
-
-                    # df = pd.DataFrame(table)
-                    # wandb.log({"completions": wandb.Table(dataframe=df)})
         
         return {
+
+            # Local part (from each device)
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
-            "rewards": rewards,
-            "advantages": advantages,
+            "advantages": advantages,   
+            
+            # All parts (from all devices) for check
+            "rewards": all_rewards,
         }
     
     
@@ -1818,21 +1851,26 @@ class GRPOTrainer(Trainer):
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
         
-        # Log completion and score tables in main process
-        if self.accelerator.is_main_process and self.args.report_to and "wandb" in self.args.report_to:
-            # Number of valid mini-batch tables for current batch
-            num_valid_tables = self.mini_batch_step + 1
-            # Convert each dictionary in _buffered_tables to a DataFrame and concatenate them
+        # Log completion exmaples (i.e., prompt + solution + score) tables in main process
+        if (
+            self.accelerator.is_main_process and
+            self.log_completions and 
+            # self.state.global_step % self.args.logging_steps == 0 and
+            self.args.report_to and "wandb" in self.args.report_to and
+            self.completion_examples
+        ):
+            # Convert each dictionary in completion_examples to a DataFrame and concatenate them
             df = pd.concat(
-                [pd.DataFrame(d) for d in self._buffered_tables[:num_valid_tables]], 
+                [pd.DataFrame(d) for d in self.completion_examples], 
                 ignore_index=True
             )
             wandb.log({"completions": wandb.Table(dataframe=df)})
         
         # logs = {**logs, **metrics}      # raw logs + grpo metrics
-        output = {**logs, **metrics}   # raw logs + grpo metrics
-
-        self._metrics[mode].clear()
+        output = {**logs, **metrics}    # raw logs + grpo metrics
+        
+        self._metrics[mode].clear()         # reset _metrics for next log
+        self.completion_examples.clear()    # reset completion_examples for next log
         
         self.state.log_history.append(output)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, output)

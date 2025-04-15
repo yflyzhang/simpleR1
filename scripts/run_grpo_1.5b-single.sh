@@ -7,8 +7,8 @@ model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
 # model_name_or_path=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
 
-# dataset=nlile/hendrycks-MATH-benchmark
-dataset=meta-math/MetaMathQA
+dataset=nlile/hendrycks-MATH-benchmark
+# dataset=meta-math/MetaMathQA
 # dataset=SynthLabsAI/Big-Math-RL-Verified
 # dataset=HuggingFaceH4/MATH-500
 # dataset=hiyouga/math12k
@@ -40,7 +40,7 @@ echo "[INFO] run name: $run_name"
 echo "[INFO] logs are saved to: $LOG_FILE"
 echo
 
-# sleep 3h
+# sleep 7h
 
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
@@ -60,18 +60,19 @@ src/run_grpo.py \
     --dataset_name $dataset \
     --use_vllm True \
     --vllm_gpu_memory_utilization 0.15 \
-    --num_train_epochs 10 \
+    --num_train_epochs 1 \
     --num_generations 12 \
+    --num_generation_attempts 10 \
     --gradient_accumulation_steps 3 \
     --per_device_train_batch_size 12 \
     --num_iterations 3 \
-    --num_generation_attempts 10 \
     --torch_empty_cache_steps 1 \
-    --max_num_train_samples 10000 \
+    --max_num_train_samples 2000 \
     --max_completion_length 1024 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --scale_rewards False \
+    --mask_truncated_completions True \
     --epsilon 0.2  \
     --epsilon_high 0.3 \
     --top_p 0.95 \
@@ -81,7 +82,7 @@ src/run_grpo.py \
     --learning_rate 2e-6 \
     --save_strategy steps \
     --log_level debug \
-    --wandb_project simpleR1-2025 \
+    --wandb_project simpleR1-$(basename $dataset) \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
