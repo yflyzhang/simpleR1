@@ -342,7 +342,7 @@ class GRPOTrainer(Trainer):
         # --------------------------
         self.grpo_iteration = None                  # tracks current grpo iteration
         self.mini_batch_step = None                 # tracks mini-batch step
-        self.num_generation_attempts = args.num_generation_attempts         # max number of generation attempts
+        self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
         self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
         # Completion examples (i.e., prompt + solution + score) for wandb log
@@ -701,8 +701,8 @@ class GRPOTrainer(Trainer):
     def train(
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
-        trial: Union["optuna.Trial", Dict[str, Any]] = None,
-        ignore_keys_for_eval: Optional[List[str]] = None,
+        trial: Union["optuna.Trial", dict[str, Any]] = None,
+        ignore_keys_for_eval: Optional[list[str]] = None,
         **kwargs,
     ):
         """
@@ -713,12 +713,12 @@ class GRPOTrainer(Trainer):
                 If a `str`, local path to a saved checkpoint as saved by a previous instance of [`Trainer`]. If a
                 `bool` and equals `True`, load the last checkpoint in *args.output_dir* as saved by a previous instance
                 of [`Trainer`]. If present, training will resume from the model/optimizer/scheduler states loaded here.
-            trial (`optuna.Trial` or `Dict[str, Any]`, *optional*):
+            trial (`optuna.Trial` or `dict[str, Any]`, *optional*):
                 The trial run or the hyperparameter dictionary for hyperparameter search.
-            ignore_keys_for_eval (`List[str]`, *optional*)
+            ignore_keys_for_eval (`list[str]`, *optional*)
                 A list of keys in the output of your model (if it is a dictionary) that should be ignored when
                 gathering predictions for evaluation during the training.
-            kwargs (`Dict[str, Any]`, *optional*):
+            kwargs (`dict[str, Any]`, *optional*):
                 Additional keyword arguments used to hide deprecated arguments
         """
         if resume_from_checkpoint is False:
@@ -986,7 +986,8 @@ class GRPOTrainer(Trainer):
                 )
 
         # Update the references
-        self.state.init_training_references(self, train_dataloader, max_steps, num_train_epochs, trial)
+        # self.state.init_training_references(self, train_dataloader, max_steps, num_train_epochs, trial)     # v4.49.0
+        self.state.init_training_references(self, max_steps, num_train_epochs, trial)     # v4.51.0
 
         # tr_loss is a tensor to avoid synchronization of TPUs through .item()
         tr_loss = torch.tensor(0.0).to(args.device)
@@ -1040,7 +1041,8 @@ class GRPOTrainer(Trainer):
                     num_mini_batches = remainder
                 
                 # Split one batch to multiple mini-batches
-                batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_mini_batches)
+                # batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_mini_batches)
+                batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_mini_batches, args.device)
                 
                 # -----------------------------------------------
                 # Train the batch sample in multi-grpo iterations
@@ -1299,7 +1301,7 @@ class GRPOTrainer(Trainer):
     
     # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3668
     def training_step(
-        self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
     ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -1309,7 +1311,7 @@ class GRPOTrainer(Trainer):
         Args:
             model (`nn.Module`):
                 The model to train.
-            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+            inputs (`dict[str, Union[torch.Tensor, Any]]`):
                 The inputs and targets of the model.
 
                 The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
@@ -1387,7 +1389,8 @@ class GRPOTrainer(Trainer):
         # Check reward
         rewards = inputs['rewards'].tolist()
         # Make sure the generated sentences are diverse and contain positive samples
-        if max(rewards) != sum(self.reward_weights.tolist()) or len(set(rewards)) == 1:
+        # if max(rewards) != sum(self.reward_weights.tolist()) or len(set(rewards)) == 1:
+        if max(rewards) < max(self.reward_weights.tolist()) or len(set(rewards)) == 1:
             return False
         
         # TODO: 
@@ -1408,7 +1411,7 @@ class GRPOTrainer(Trainer):
                 # Generate and score completions in grpo_iteration=0, and reuse them for grpo_iteration=[1, num_iterations-1]
                 
                 # Rejection sampling for model generation
-                max_attempts = self.num_generation_attempts # maximum number of generation attempts
+                max_attempts = max(self.max_resample_attempts, 1) # maximum number of generation attempts
                 for attempt in range(max_attempts):
                     grpo_inputs = self._generate_and_score_completions(inputs, attempt=attempt)
 
@@ -1478,7 +1481,9 @@ class GRPOTrainer(Trainer):
                 ordered_set_of_prompts = all_prompts_text[::self.num_generations]
                 with profiling_context(self, "vLLM.generate"):
                     all_outputs = self.llm.generate(
-                        ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
+                        ordered_set_of_prompts, 
+                        sampling_params=self.sampling_params, 
+                        use_tqdm=False
                     )
                 all_completion_ids = []
                 all_completion_texts = []
@@ -1795,19 +1800,7 @@ class GRPOTrainer(Trainer):
         return loss
     
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-        # ----------------------------------------
-        # Prepare grpo inputs: generate and score the completions
-        inputs = self.prepare_grpo_inputs(inputs)
-        # ----------------------------------------
-        with torch.no_grad():
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
-        return loss, None, None
-    
-
-    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         """
         Log `logs` on the various objects watching training.
 
@@ -1818,7 +1811,7 @@ class GRPOTrainer(Trainer):
             `if state.is_world_process_zero`
 
         Args:
-            logs (`Dict[str, float]`):
+            logs (`dict[str, float]`):
                 The values to log.
             start_time (`Optional[float]`):
                 The start of training.
@@ -1889,6 +1882,16 @@ class GRPOTrainer(Trainer):
         
         # ------------------------------------
 
+    # def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
+    #     # ----------------------------------------
+    #     # Prepare grpo inputs: generate and score the completions
+    #     inputs = self.prepare_grpo_inputs(inputs)
+    #     # ----------------------------------------
+    #     with torch.no_grad():
+    #         with self.compute_loss_context_manager():
+    #             loss = self.compute_loss(model, inputs)
+    #         loss = loss.mean().detach()
+    #     return loss, None, None
         
     # Overwrite `set_initial_training_values` as it's not accurate in estimating: 
     # - num_update_steps_per_epoch

@@ -29,7 +29,20 @@ class ScriptArguments:
             type, inplace operation. See https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992.
     """
 
-    dataset_name: str = field(metadata={"help": "Dataset name."})
+    # dataset_name: str = field(
+    #     default=None,
+    #     metadata={"help": "Dataset name."}
+    # )
+    
+    train_dataset_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Train dataset name."},
+    )
+    eval_dataset_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Test dataset name."},
+    )
+
     dataset_config: Optional[str] = field(
         default=None,
         metadata={
@@ -37,8 +50,8 @@ class ScriptArguments:
             "function."
         },
     )
-    dataset_train_split: str = field(default="train", metadata={"help": "Dataset split to use for training."})
-    dataset_test_split: str = field(default="test", metadata={"help": "Dataset split to use for evaluation."})
+    # dataset_train_split: str = field(default="train", metadata={"help": "Dataset split to use for training."})
+    # dataset_test_split: str = field(default="test", metadata={"help": "Dataset split to use for evaluation."})
     gradient_checkpointing_use_reentrant: bool = field(
         default=False,
         metadata={"help": "Whether to apply `use_reentrant` for gradient checkpointing."},
@@ -330,7 +343,7 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
     )
 
-    num_generation_attempts: int = field(
+    max_resample_attempts: int = field(
         default=10,
         metadata={"help": "Max number of attempts per prompt in model generation."},
     )

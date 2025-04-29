@@ -17,13 +17,13 @@ import os
 import sys
 import random
 import logging
-from dataclasses import dataclass, field
+# from dataclasses import dataclass, field
 
 
 import torch
 import datasets
 import transformers
-from datasets import load_dataset
+# from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -47,8 +47,7 @@ from rewards import (
     reasoning_steps_reward,
 )
 
-
-from utils import init_wandb_training, get_tokenizer
+from utils import init_wandb_training, get_tokenizer, get_dataset
 
 
 logger = logging.getLogger(__name__)
@@ -95,62 +94,25 @@ def main():
     ##################
     # Load the dataset
     ##################
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    
-    # -----------------------------------
-    # Check if there is a column named `problem` and `solution` (may change it accordingly)
-    split_name = 'train' if 'train' in dataset else 'test'  # use 'test' split if 'train' split is not available
-    columns = dataset[split_name].column_names
-    # if 'problem' in columns and 'solution' in columns:
-    if 'problem' not in columns:
-        for feture in columns:
-            if feture.lower() in ['problem', 'question', 'query']:
-                dataset = dataset.rename_column(feture, 'problem')
-                break
-        else:
-            raise ValueError("no column named 'problem' in the datset!")
-    if 'solution' not in columns:
-        for feture in columns:
-            if feture.lower() in ['solution', 'answer', 'response']:
-                dataset = dataset.rename_column(feture, 'solution')
-                break
-        else:
-            raise ValueError("no column named 'solution' in the datset!")
+    system_prompt = training_args.system_prompt
+    train_dataset = get_dataset(
+        script_args.train_dataset_name, split='train', system_prompt=system_prompt
+    )
+    eval_dataset = None
+    if script_args.eval_dataset_name:
+        eval_dataset = get_dataset(
+            script_args.eval_dataset_name, split='test', system_prompt=system_prompt
+        )
     
     # >>>>> add a breakpoint for debug? <<<<<
     # torch.distributed.breakpoint(rank=0)
     
-    # Format into conversation
-    def make_conversation(example):
-        prompt = []
-        
-        if training_args.system_prompt is not None:
-            prompt.append({"role": "system", "content": training_args.system_prompt})
-        
-        prompt.append({"role": "user", "content": example["problem"]})
-        return {"prompt": prompt}
-    
-    dataset = dataset.map(make_conversation)
-    
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
-    
-    
-    # Use a small set for fast check
+    # Use a small dataset for fast check
     # Make sure it's called after data preprocessing
-    train_dataset = dataset[split_name]
-    if script_args.max_num_train_samples is not None:
-        if script_args.max_num_train_samples > 0:
-            num_samples = min(script_args.max_num_train_samples, len(train_dataset))
-        else:
-            num_samples = len(train_dataset)
+    if script_args.max_num_train_samples is not None and script_args.max_num_train_samples > 0:
+        num_samples = min(script_args.max_num_train_samples, len(train_dataset))
         sample_ids = random.sample(range(len(train_dataset)), num_samples)
-        train_dataset = train_dataset.select(sample_ids)
-    
-    # # >>>>> add a breakpoint for debug? <<<<<
-    # torch.distributed.breakpoint(rank=0)
-    
+        train_dataset = train_dataset.select(sample_ids)    
     
     ################
     # Load tokenizer
@@ -254,7 +216,7 @@ def main():
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=train_dataset,
-        # eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),  
     )
     
@@ -308,7 +270,7 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+        metrics["eval_samples"] = len(eval_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     

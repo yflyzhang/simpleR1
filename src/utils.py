@@ -5,10 +5,11 @@ import time
 from typing import Generator
 from transformers import (
     AutoTokenizer, 
-    PreTrainedTokenizer,
+    PreTrainedTokenizer, 
     Trainer, 
     is_wandb_available
 )
+from datasets import load_dataset
 
 if is_wandb_available():
     import wandb
@@ -59,6 +60,57 @@ def get_tokenizer(
     
     return tokenizer
 
+
+########################
+# Get train/eval dataset
+########################
+
+def get_dataset(dataset_name, split='train', system_prompt=None):
+
+    if dataset_name == 'openai/gsm8k':
+        dataset = load_dataset(dataset_name, name='main', split=split)
+    else:
+        dataset = load_dataset(dataset_name, split=split)
+    
+    columns = dataset.column_names
+    
+    # Check if 'problem' is in columns (may change it accordingly):
+    if 'problem' not in columns:
+        for feture in columns:
+            # 'problem', 'query' can be considered as 'problem' column
+            # (may change or add columns accordingly)
+            if feture.lower() in ['question', 'problem', 'query']:
+                dataset = dataset.rename_column(feture, 'problem')
+                break
+        else:
+            raise ValueError("No column named 'problem' in the datset!")
+    
+    # Check if 'solution' is in columns:
+    if 'solution' not in columns:
+        for feture in columns:
+            # 'answer', 'response' can be considered as 'solution' column
+            if feture.lower() in ['answer', 'solution', 'response']:
+                dataset = dataset.rename_column(feture, 'solution')
+                break
+        else:
+            raise ValueError("No column named 'solution' in the datset!")
+    
+    # Format into conversation
+    def make_conversation(example):
+        prompt = []
+        
+        if system_prompt is not None:
+            prompt.append({"role": "system", "content": system_prompt})
+        
+        prompt.append({"role": "user", "content": example["problem"]})
+        return {"prompt": prompt}
+    
+    dataset = dataset.map(make_conversation)
+
+    # if "messages" in dataset.column_names:
+    #     dataset = dataset.remove_columns("messages")
+    
+    return dataset
 
 
 ####################
