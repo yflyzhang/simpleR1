@@ -64,7 +64,7 @@ src/run_grpo.py \
     --vllm_gpu_memory_utilization 0.2 \
     --num_train_epochs 1 \
     --num_generations 12 \
-    --max_resample_attempts 10 \
+    --max_resample_attempts 3 \
     --gradient_accumulation_steps 3 \
     --per_device_train_batch_size 12 \
     --per_device_eval_batch_size 12 \
@@ -85,11 +85,11 @@ src/run_grpo.py \
     --learning_rate 1e-6 \
     --save_strategy steps \
     --log_level debug \
-    --wandb_project simpleR1-$(basename $train_dataset) \
+    --wandb_project test \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
-    
+    # --wandb_project simpleR1-$(basename $train_dataset) \
 # --eval_strategy steps \
 #     --eval_on_start True \
     # --seed 95 \

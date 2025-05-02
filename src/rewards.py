@@ -44,13 +44,13 @@ def _is_conversational(examples):
     return False
 
 
-def accuracy_reward(completions, solution, **kwargs):
+def accuracy_reward(completions, solutions, **kwargs):
     """
     Reward function that checks if the completion is the same as the ground truth.
     
-    Note: `solution` is passed by kwargs (**reward_kwargs) and is a list of solution text.
+    Note: `solutions` may be passed by kwargs (**reward_kwargs) and is a list of solution text.
         >> keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-        >> reward_kwargs = {key: [example[key] for example in inputs] for key in keys}     # reward_kwargs contains 'solution'
+        >> reward_kwargs = {key: [example[key] for example in inputs] for key in keys}     # reward_kwargs contains 'solutions'
         >> output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
     
     math_verify.parser.parse:
@@ -83,7 +83,7 @@ def accuracy_reward(completions, solution, **kwargs):
     if _is_conversational(completions):
         completions = [completion["content"] for completion in completions]
     rewards = []
-    for completion_to_parse, gold_to_parse in zip(completions, solution):
+    for completion_to_parse, gold_to_parse in zip(completions, solutions):
         
         # Parse gold/ground truth
         gold_parsed = parse(gold_to_parse)
@@ -213,14 +213,14 @@ def reasoning_steps_reward(completions, **kwargs):
 
 # TODO: parse and verify needs to be fixed in the following reward functions!
 
-def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
+def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
 
     Args:
         completions: List of model completions
-        solution: List of ground truth solutions
+        solutions: List of ground truth solutions
 
     Returns:
         List of rewards where:
@@ -231,7 +231,7 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
 
     # First check correctness of answers
     correctness = []
-    for content, sol in zip(contents, solution):
+    for content, sol in zip(contents, solutions):
         gold_parsed = parse(
             sol,
             extraction_mode="first_match",
@@ -293,7 +293,7 @@ def get_cosine_scaled_reward(
     max_value_correct: float = 1.0,
     max_len: int = 1000,
 ):
-    def cosine_scaled_reward(completions, solution, **kwargs):
+    def cosine_scaled_reward(completions, solutions, **kwargs):
         """Reward function that scales based on completion length using a cosine schedule.
 
         Shorter correct solutions are rewarded more than longer ones.
@@ -301,7 +301,7 @@ def get_cosine_scaled_reward(
 
         Args:
             completions: List of model completions
-            solution: List of ground truth solutions
+            solutions: List of ground truth solutions
 
         This function is parameterized by the following arguments:
             min_value_wrong: Minimum reward for wrong answers
@@ -313,7 +313,7 @@ def get_cosine_scaled_reward(
         contents = [completion["content"] for completion in completions]
         rewards = []
 
-        for content, sol in zip(contents, solution):
+        for content, sol in zip(contents, solutions):
             gold_parsed = parse(sol, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
             if len(gold_parsed) == 0:
                 rewards.append(1.0)  # Skip unparseable examples
