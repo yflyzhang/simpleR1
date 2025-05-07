@@ -98,21 +98,28 @@ def main():
     train_dataset = get_dataset(
         script_args.train_dataset_name, split='train', system_prompt=system_prompt
     )
-    eval_dataset = None
-    if script_args.eval_dataset_name:
-        eval_dataset = get_dataset(
-            script_args.eval_dataset_name, split='test', system_prompt=system_prompt
-        )
-    
-    # >>>>> add a breakpoint for debug? <<<<<
-    # torch.distributed.breakpoint(rank=0)
-    
-    # Use a small dataset for fast check
+
+    # Note: Use a small dataset for fast check. Should be commented in production!
     # Make sure it's called after data preprocessing
     if script_args.max_num_train_samples is not None and script_args.max_num_train_samples > 0:
         num_samples = min(script_args.max_num_train_samples, len(train_dataset))
         sample_ids = random.sample(range(len(train_dataset)), num_samples)
         train_dataset = train_dataset.select(sample_ids)    
+
+    eval_dataset = None
+    if script_args.eval_dataset_name:
+        eval_dataset = get_dataset(
+            script_args.eval_dataset_name, split='test', system_prompt=system_prompt
+        )
+        if script_args.max_num_test_samples is not None and script_args.max_num_test_samples > 0:
+            num_samples = min(script_args.max_num_test_samples, len(eval_dataset))
+            sample_ids = random.sample(range(len(eval_dataset)), num_samples)
+            eval_dataset = eval_dataset.select(sample_ids)
+    
+    
+    # # >>>>> add a breakpoint for debug? <<<<<
+    # torch.distributed.breakpoint(rank=0)
+    
     
     ################
     # Load tokenizer

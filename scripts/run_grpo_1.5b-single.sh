@@ -12,13 +12,14 @@ train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
 # train_dataset=SynthLabsAI/Big-Math-RL-Verified
-# train_dataset=HuggingFaceH4/MATH-500
 # train_dataset=hiyouga/math12k
 # train_dataset=gneubig/aime-1983-2024
 # train_dataset=open-r1/OpenR1-Math-220k
 # train_dataset=agentica-org/DeepScaleR-Preview-Dataset
 # train_dataset=RUC-AIBOX/STILL-3-Preview-RL-Data
 # train_dataset=Maxwell-Jia/AIME_2024
+
+eval_dataset=HuggingFaceH4/MATH-500
 
 
 model_name=$(basename $model_name_or_path)
@@ -60,17 +61,19 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --model_name_or_path $model_name_or_path \
     --train_dataset_name $train_dataset \
+    --eval_dataset_name $eval_dataset \
     --use_vllm True \
     --vllm_gpu_memory_utilization 0.2 \
     --num_train_epochs 1 \
     --num_generations 6 \
-    --max_resample_attempts 10 \
+    --max_resample_attempts 3 \
     --gradient_accumulation_steps 3 \
     --per_device_train_batch_size 6 \
-    --per_device_eval_batch_size 12 \
+    --per_device_eval_batch_size 48 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 10000 \
+    --max_num_test_samples 20 \
     --max_completion_length 2048 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
@@ -84,14 +87,16 @@ src/run_grpo.py \
     --compute_kl True \
     --learning_rate 1e-6 \
     --save_strategy steps \
+    --eval_strategy steps \
+    --eval_steps 10 \
+    --eval_on_start True \
     --log_level debug \
     --wandb_project simpleR1-$(basename $train_dataset) \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
     
-# --eval_strategy steps \
-#     --eval_on_start True \
+    
     # --seed 95 \
     
 

@@ -106,7 +106,7 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
         return {"prompt": prompt}
     
     dataset = dataset.map(make_conversation)
-
+    
     # if "messages" in dataset.column_names:
     #     dataset = dataset.remove_columns("messages")
     

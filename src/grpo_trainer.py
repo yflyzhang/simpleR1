@@ -340,13 +340,12 @@ class GRPOTrainer(Trainer):
         # Multi-step
         self.num_iterations = args.num_iterations   # = 𝜇 in the GRPO paper
         # --------------------------
-        self.grpo_iteration = None                  # tracks current grpo iteration
-        self.mini_batch_step = None                 # tracks mini-batch step
+        self.mode = None                            # train or eval mode
+        self.grpo_iteration = -1                    # tracks current grpo iteration
+        self.mini_batch_step = -1                   # tracks mini-batch step
         self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
         self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
-        # Completion examples (i.e., prompt + solution + score) for wandb log
-        self.completion_examples = []
         
         # Clip higher
         self.epsilon = args.epsilon                 # clip value (pi_theta/pi_old)
@@ -369,6 +368,8 @@ class GRPOTrainer(Trainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Completion examples (e.g., prompt + solution + score) for wandb log
+        self._completion_examples = {"train": [], "eval": []}
         self.log_completions = args.log_completions
         
         # Use num_train_epochs to estimate max_steps
@@ -698,7 +699,7 @@ class GRPOTrainer(Trainer):
     
     # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3668
     def training_step(
-        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+        self, model: nn.Module, inputs: list[str, Union[torch.Tensor, Any]], num_items_in_batch=None
     ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -723,6 +724,7 @@ class GRPOTrainer(Trainer):
         
         # ----------------------------------------
         # Prepare grpo inputs: generate and score the completions
+        self.mode = 'train'
         inputs = self.prepare_grpo_inputs(inputs)
         # ----------------------------------------
         
@@ -807,19 +809,26 @@ class GRPOTrainer(Trainer):
         return True
     
     
-    def prepare_grpo_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    def prepare_grpo_inputs(
+        self, 
+        inputs: list[str, Union[torch.Tensor, Any]],
+    ) -> dict[str, Union[torch.Tensor, Any]]:
         """
         Prepare `inputs` before feeding them to the model 
         """
-        mode = "eval" if self.control.should_evaluate else "train"
-        if mode == "train":
+        
+        mode = self.mode
+        if not mode:
+            raise ValueError(f"`mode` should be specified clearly! It could be 'train' or 'eval'.")
+        
+        if mode == "train":     # train mode
             # if self.state.global_step % self.num_iterations == 0:
             if self.grpo_iteration == 0:
                 # Generate and score completions in grpo_iteration=0, and reuse them for later grpo iterations
                 # Rejection sampling for model generation
                 max_attempts = max(self.max_resample_attempts, 1) # maximum number of generation attempts
                 for attempt in range(1, max_attempts+1):
-                    grpo_inputs = self._generate_and_score_completions(inputs, attempt=attempt)
+                    grpo_inputs = self._generate_score_log_completions(inputs, attempt=attempt)
 
                     # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
@@ -850,13 +859,13 @@ class GRPOTrainer(Trainer):
             else:
                 grpo_inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
             self._step += 1
-
-        else:
+        
+        else:           # eval mode
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            grpo_inputs = self._generate_and_score_completions(inputs)
+            grpo_inputs = self._generate_score_log_completions(inputs)
         return grpo_inputs
     
-
+    
     def _generate_completions(self, inputs):
         """
         Generate completions for the given inputs.
@@ -987,6 +996,8 @@ class GRPOTrainer(Trainer):
         """
         Score completions for the given input generations.
         """
+        mode = self.mode
+
         device = self.accelerator.device
         prompts = inputs['prompts']
         completions = inputs['completions']
@@ -997,6 +1008,12 @@ class GRPOTrainer(Trainer):
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
+            
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+            else:
+                reward_func_name = reward_func.__name__
+
             if isinstance(
                 reward_func, nn.Module
             ):  # Module instead of PretrainedModel for compat with compiled models
@@ -1047,18 +1064,33 @@ class GRPOTrainer(Trainer):
         if self.scale_rewards:
             all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
         
+        # Get accuracy reward
+        # Note: by default, the first reward functions should be the accuracy reward
+        all_accuracy_reward = all_rewards_per_func[:, 0]
+
         # Print reward info in the main process
         if self.accelerator.is_main_process:
             all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
-            logger.debug(
-                f"\n  global_step={self.state.global_step+1},"
-                f" grpo_iteration={self.grpo_iteration+1},"
-                f" mini_batch (grad. acc.)={self.mini_batch_step+1}"
-                f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
-                f"\n  rewards:            {all_rewards.cpu().tolist()}, "
-                f"\n  advantages:         {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
-            )
-        
+
+            if mode == 'train':
+                logger.debug(
+                    f"\n[{mode}]  global_step={self.state.global_step+1},"
+                    f" grpo_iteration={self.grpo_iteration+1},"
+                    f" mini_batch (grad. acc.)={self.mini_batch_step+1}"
+                    # f"\n  accuracy:            {all_accuracy_reward.cpu().tolist()}, "
+                    f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
+                    f"\n  rewards:            {all_rewards.cpu().tolist()}, "
+                    f"\n  advantages:         {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
+                )
+            else:
+                # accuracy is primary goal!
+                logger.debug(
+                    f"\n[{mode}]  global_step={self.state.global_step+1},"
+                    f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
+                    f"\n  accuracy reward:    {all_accuracy_reward.cpu().tolist()}"
+                    # f"\n  rewards:            {all_rewards.cpu().tolist()}"
+                )
+            
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
@@ -1074,7 +1106,7 @@ class GRPOTrainer(Trainer):
 
 
 
-    def _generate_and_score_completions(
+    def _generate_score_log_completions(
         self, 
         inputs: list[str, Union[torch.Tensor, Any]],
         attempt: int = 1
@@ -1103,6 +1135,11 @@ class GRPOTrainer(Trainer):
         advantages = all_advantages[start:start+len(inputs['prompt_ids'])]      # [i:i+len(prompts)]
         inputs['advantages'] = advantages   # to compute loss
         inputs['rewards'] = all_rewards     # to check model generation
+
+        # Get accuracy reward
+        # Note: by default, the first reward functions should be the accuracy reward
+        all_accuracy_reward = all_rewards_per_func[:, 0]
+        inputs['accuracy'] = all_accuracy_reward     # accuracy
         
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
@@ -1117,9 +1154,7 @@ class GRPOTrainer(Trainer):
     def _log_metrics(self, inputs, all_rewards_per_func, all_rewards):
         
         # Log the metrics
-        # TODO:  train and eval mode check
-        # https://github.com/huggingface/trl/pull/3337
-        mode = "eval" if self.control.should_evaluate else "train"
+        mode = self.mode
 
         eos_idx = inputs['eos_idx']
         prompts = inputs['prompts']
@@ -1180,7 +1215,7 @@ class GRPOTrainer(Trainer):
             completions_to_log = gather_object(completions_text)
             solutions_to_log = gather_object(solutions_text)
             rewards_to_log = all_rewards.tolist()
-
+            
             # Completion table to be logged later
             completion_table = {
                 "global_step": [self.state.global_step+1] * len(rewards_to_log),
@@ -1190,7 +1225,7 @@ class GRPOTrainer(Trainer):
                 "completion": completions_to_log,
                 "reward": rewards_to_log,
             }
-            self.completion_examples.append(completion_table)
+            self._completion_examples[mode].append(completion_table)
     
     
     def _get_batch_logps(self, prompt_completion_ids, attention_mask, logits_to_keep):
@@ -1257,7 +1292,7 @@ class GRPOTrainer(Trainer):
         # Compute the loss
         advantages = inputs["advantages"]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
-        # _generate_and_score_completions) and use per_token_logps.detach() instead.
+        # _generate_score_log_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         # coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
@@ -1285,7 +1320,8 @@ class GRPOTrainer(Trainer):
         # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         
         # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
+        # mode = "eval" if self.control.should_evaluate else "train"
+        mode = self.mode
         
         # Compute kl even when beta=0, to monitor model update
         if self.compute_kl:
@@ -1328,7 +1364,8 @@ class GRPOTrainer(Trainer):
                 speed_metrics("train", start_time, num_tokens=self.state.num_input_tokens_seen)
         
         # Log grpo train/eval metrics
-        mode = "eval" if self.control.should_evaluate else "train"
+        # mode = "eval" if self.control.should_evaluate else "train"
+        mode = self.mode
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
@@ -1342,20 +1379,20 @@ class GRPOTrainer(Trainer):
             self.log_completions and 
             # self.state.global_step % self.args.logging_steps == 0 and
             self.args.report_to and "wandb" in self.args.report_to and
-            self.completion_examples
+            self._completion_examples[mode]
         ):
-            # Convert each dictionary in completion_examples to a DataFrame and concatenate them
+            # Convert each dictionary in _completion_examples[mode] to a DataFrame and concatenate them
             df = pd.concat(
-                [pd.DataFrame(d) for d in self.completion_examples], 
+                [pd.DataFrame(d) for d in self._completion_examples[mode]], 
                 ignore_index=True
             )
-            wandb.log({"completions": wandb.Table(dataframe=df)})
+            wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
         
         # logs = {**logs, **metrics}      # raw logs + grpo metrics
         output = {**logs, **metrics}    # raw logs + grpo metrics
         
         self._metrics[mode].clear()         # reset _metrics for next log
-        self.completion_examples.clear()    # reset completion_examples for next log
+        self._completion_examples[mode].clear()    # reset completion_examples for next log
         
         self.state.log_history.append(output)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, output)
@@ -1374,17 +1411,219 @@ class GRPOTrainer(Trainer):
         
         # ------------------------------------
 
+    # TODO: under test
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
+        # ----------------------------------------
+        self.mode = 'eval'
+        # Prepare grpo inputs: generate and score the completions
+        inputs = self.prepare_grpo_inputs(inputs)
+        # ----------------------------------------
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+            loss = loss.mean().detach()
+        return loss, None, None
 
-    # def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-    #     # ----------------------------------------
-    #     # Prepare grpo inputs: generate and score the completions
-    #     inputs = self.prepare_grpo_inputs(inputs)
-    #     # ----------------------------------------
-    #     with torch.no_grad():
-    #         with self.compute_loss_context_manager():
-    #             loss = self.compute_loss(model, inputs)
-    #         loss = loss.mean().detach()
-    #     return loss, None, None
+    
+    # TODO: under test
+    def evaluate(
+        self,
+        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float]:
+        """
+        Run evaluation and returns metrics.
+
+        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
+        (pass it to the init `compute_metrics` argument).
+
+        You can also subclass and override this method to inject custom behavior.
+
+        Args:
+            eval_dataset (Union[`Dataset`, dict[str, `Dataset`]), *optional*):
+                Pass a dataset if you wish to override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns
+                not accepted by the `model.forward()` method are automatically removed. If it is a dictionary, it will
+                evaluate on each dataset, prepending the dictionary key to the metric name. Datasets must implement the
+                `__len__` method.
+
+                <Tip>
+
+                If you pass a dictionary with names of datasets as keys and datasets as values, evaluate will run
+                separate evaluations on each dataset. This can be useful to monitor how training affects other
+                datasets or simply to get a more fine-grained evaluation.
+                When used with `load_best_model_at_end`, make sure `metric_for_best_model` references exactly one
+                of the datasets. If you, for example, pass in `{"data1": data1, "data2": data2}` for two datasets
+                `data1` and `data2`, you could specify `metric_for_best_model="eval_data1_loss"` for using the
+                loss on `data1` and `metric_for_best_model="eval_data2_loss"` for the loss on `data2`.
+
+                </Tip>
+
+            ignore_keys (`list[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
+                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
+                "eval_bleu" if the prefix is "eval" (default)
+
+        Returns:
+            A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
+            dictionary also contains the epoch number which comes from the training state.
+        """
+        
+        self.mode = 'eval'
+        
+        # handle multipe eval datasets
+        # TODO: add support for list of eval datasets
+        override = eval_dataset is not None
+        eval_dataset = eval_dataset if override else self.eval_dataset
+        if isinstance(eval_dataset, dict):
+            metrics = {}
+            for eval_dataset_name, _eval_dataset in eval_dataset.items():
+                dataset_metrics = self.evaluate(
+                    eval_dataset=_eval_dataset if override else eval_dataset_name,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                )
+                metrics.update(dataset_metrics)
+            return metrics
+        
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        dataloader = self.get_eval_dataloader(eval_dataset)
+        if self.is_fsdp_xla_v2_enabled:
+            dataloader = tpu_spmd_dataloader(dataloader)
+
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+
+        start_time = time.time()
+
+        # eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
+        # output = eval_loop(
+        #     eval_dataloader,
+        #     description="Evaluation",
+        #     # No point gathering the predictions if there are no metrics, otherwise we defer to
+        #     # self.args.prediction_loss_only
+        #     prediction_loss_only=True if self.compute_metrics is None else None,
+        #     ignore_keys=ignore_keys,
+        #     metric_key_prefix=metric_key_prefix,
+        # )
+
+        #    https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L4205
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+        Works both with or without labels.
+        """
+        description="Evaluation"
+        args = self.args
+        
+        prediction_loss_only=True if self.compute_metrics is None else None,
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.deepspeed is None:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+        
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+        
+        if len(self.accelerator._models) == 0 and model is self.model:
+            start_time = time.time()
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled or (self.is_fsdp_enabled and self.accelerator.mixed_precision != "fp8")
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+            self.model_preparation_time = round(time.time() - start_time, 4)
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
+        
+        
+        batch_size = self.args.eval_batch_size
+
+        logger.info(f"\n***** Running {description} *****")
+        if has_length(dataloader):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+        
+        model.eval()
+        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
+            self.optimizer.eval()
+        
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = getattr(dataloader, "dataset", None)
+
+        if args.past_index >= 0:
+            self._past = None
+        
+
+        metrics = None
+        eval_set_kwargs = {}
+
+        # Will be useful when we have an iterable dataset so don't know its length.
+        observed_num_examples = 0
+        all_accuracies = []
+        
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+            
+            # Prediction step
+            # TODO: rewrite `_generate_score_log_completions` so as to reuse it in evaluate.
+            # should incude original accuracy reward, format reward, etc.
+            # losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            # main_input_name = getattr(self.model, "main_input_name", "input_ids")
+            # inputs_decode = (
+            #     self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
+            # )
+            
+            grpo_inputs = self.prepare_grpo_inputs(inputs)
+            all_accuracy = grpo_inputs['accuracy'].tolist()
+            all_accuracies.extend(all_accuracy)
+            
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+        num_samples = observed_num_examples
+
+        if self.accelerator.is_main_process:
+            all_accuracies = np.array(all_accuracies).reshape(-1, self.num_generations)
+
+            logger.info(f"\n***** Eval results *****")
+            print(f"\n  Accuracy: {all_accuracies.mean()}")
+            
+            # mode = 'eval'
+            mode = self.mode
+            accs = all_accuracies.mean(-1).tolist()
+            self._metrics[mode][f"accuracy"].extend(accs)
+            
+            # # >>>>> add a breakpoint for debug? <<<<<
+            # torch.distributed.breakpoint(rank=0)
+            
+            # {k:len(v) for k,v in self._metrics[mode].items()}
+
+            # call log
+            # self.log(output.metrics)
+            self.log(logs={})
+            
 
 
 
