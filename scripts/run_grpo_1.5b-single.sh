@@ -9,7 +9,7 @@ model_name_or_path=Qwen/Qwen3-1.7B
 
 
 train_dataset=openai/gsm8k
-# train_dataset=nlile/hendrycks-MATH-benchmark
+train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
 # train_dataset=SynthLabsAI/Big-Math-RL-Verified
 # train_dataset=HuggingFaceH4/MATH-500
@@ -63,15 +63,15 @@ src/run_grpo.py \
     --use_vllm True \
     --vllm_gpu_memory_utilization 0.2 \
     --num_train_epochs 1 \
-    --num_generations 12 \
-    --max_resample_attempts 3 \
+    --num_generations 6 \
+    --max_resample_attempts 10 \
     --gradient_accumulation_steps 3 \
-    --per_device_train_batch_size 12 \
+    --per_device_train_batch_size 6 \
     --per_device_eval_batch_size 12 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 10000 \
-    --max_completion_length 1024 \
+    --max_completion_length 2048 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --scale_rewards True \
@@ -80,16 +80,16 @@ src/run_grpo.py \
     --epsilon_high 0.3 \
     --top_p 0.95 \
     --temperature 1.0 \
-    --beta 0.0 \
+    --beta 0.0001 \
     --compute_kl True \
     --learning_rate 1e-6 \
     --save_strategy steps \
     --log_level debug \
-    --wandb_project test \
+    --wandb_project simpleR1-$(basename $train_dataset) \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
-    # --wandb_project simpleR1-$(basename $train_dataset) \
+    
 # --eval_strategy steps \
 #     --eval_on_start True \
     # --seed 95 \

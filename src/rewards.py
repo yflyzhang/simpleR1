@@ -91,6 +91,7 @@ def accuracy_reward(completions, solutions, **kwargs):
         if len(gold_parsed) != 0:
             # Parse completion
             # Loose mode:
+            # TODO: may extract from answer block (e.g., <answer>...</answer>) only
             answer_parsed = parse(completion_to_parse)
             
             # Strict mode:
