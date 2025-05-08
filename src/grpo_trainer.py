@@ -1497,22 +1497,9 @@ class GRPOTrainer(Trainer):
         #   https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
         
         # ------------------------------------
-    
-    # # TODO: under test
-    # def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-    #     # ----------------------------------------
-    #     self.mode = 'eval'
-    #     # Prepare grpo inputs: generate and score the completions
-    #     inputs = self.prepare_grpo_inputs(inputs)
-    #     # ----------------------------------------
-    #     with torch.no_grad():
-    #         with self.compute_loss_context_manager():
-    #             loss = self.compute_loss(model, inputs)
-    #         loss = loss.mean().detach()
-    #     return loss, None, None
 
     
-    # TODO: under test
+    # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
     def evaluate(
         self,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
@@ -1686,6 +1673,7 @@ class GRPOTrainer(Trainer):
 
         
         if self.accelerator.is_main_process:
+            # Compute custom metrics
             all_accuracies = np.array(all_accuracies).reshape(-1, self.num_eval_generations)
             # mode = 'eval'
             mode = self.mode
