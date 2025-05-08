@@ -66,23 +66,27 @@ src/run_grpo.py \
     --vllm_gpu_memory_utilization 0.2 \
     --num_train_epochs 1 \
     --num_generations 6 \
+    --num_eval_generations 16 \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 3 \
     --per_device_train_batch_size 6 \
-    --per_device_eval_batch_size 48 \
+    --per_device_eval_batch_size 64 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 10000 \
-    --max_num_test_samples 20 \
+    --max_num_test_samples 50 \
     --max_completion_length 2048 \
+    --max_eval_completion_length 3600 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --scale_rewards True \
     --mask_truncated_completions True \
     --epsilon 0.2 \
     --epsilon_high 0.3 \
-    --top_p 0.95 \
     --temperature 1.0 \
+    --top_p 0.95 \
+    --eval_temperature 0.7 \
+    --eval_top_p 0.95 \
     --beta 0.0001 \
     --compute_kl True \
     --learning_rate 1e-6 \

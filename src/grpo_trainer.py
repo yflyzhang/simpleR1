@@ -332,9 +332,20 @@ class GRPOTrainer(Trainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.temperature = args.temperature
+
+        # Eval parameters
+        # If not explicitly specified, use parameters from training mode
+        self.num_eval_generations = args.num_eval_generations if args.num_eval_generations is not None else args.num_generations
+        self.max_eval_completion_length = args.max_eval_completion_length if args.max_eval_completion_length is not None else args.max_completion_length
+        self.eval_temperature = args.eval_temperature if args.eval_temperature is not None else args.temperature
+        self.eval_top_p = args.eval_top_p if args.eval_top_p is not None else args.top_p
+        self.eval_top_k = args.eval_top_k if args.eval_top_k is not None else args.top_k
+        self.eval_min_p = args.eval_min_p if args.eval_min_p is not None else args.min_p
+
+
         self.use_vllm = args.use_vllm
 
         # Multi-step
@@ -390,21 +401,21 @@ class GRPOTrainer(Trainer):
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
-        global_batch_size = args.per_device_train_batch_size * num_processes
-        possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
+        effective_batch_size = args.per_device_train_batch_size * num_processes
+        possible_values = [n_gen for n_gen in range(2, effective_batch_size + 1) if (effective_batch_size) % n_gen == 0]
         if self.num_generations not in possible_values:
             raise ValueError(
-                f"The global train batch size ({num_processes} x {args.per_device_train_batch_size}) must be evenly "
+                f"The effective train batch size ({num_processes} x {args.per_device_train_batch_size}) must be evenly "
                 f"divisible by the number of generations per prompt ({self.num_generations}). Given the current train "
                 f"batch size, the valid values for the number of generations are: {possible_values}."
             )
         if self.args.eval_strategy != "no":
-            global_batch_size = args.per_device_eval_batch_size * num_processes
-            possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
-            if self.num_generations not in possible_values:
+            effective_batch_size = args.per_device_eval_batch_size * num_processes
+            possible_values = [n_gen for n_gen in range(2, effective_batch_size + 1) if (effective_batch_size) % n_gen == 0]
+            if self.num_eval_generations not in possible_values:
                 raise ValueError(
-                    f"The global eval batch size ({num_processes} x {args.per_device_eval_batch_size}) must be evenly "
-                    f"divisible by the number of generations per prompt ({self.num_generations}). Given the current "
+                    f"The effective eval batch size ({num_processes} x {args.per_device_eval_batch_size}) must be evenly "
+                    f"divisible by the eval number of generations per prompt ({self.num_eval_generations}). Given the current "
                     f"eval batch size, the valid values for the number of generations are: {possible_values}."
                 )
 
@@ -507,6 +518,18 @@ class GRPOTrainer(Trainer):
                     repetition_penalty=args.repetition_penalty,
                 )
 
+                # Eval sampling parameters
+                self.eval_sampling_params = SamplingParams(
+                    max_tokens=self.max_eval_completion_length,
+                    guided_decoding=guided_decoding,
+                    n=args.num_eval_generations,
+                    temperature=args.eval_temperature,
+                    top_p=args.eval_top_p,
+                    top_k=-1 if args.eval_top_k is None else args.eval_top_k,
+                    min_p=0.0 if args.eval_min_p is None else args.eval_min_p,
+                    repetition_penalty=args.repetition_penalty,
+                )
+
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
 
             # When using vLLM, the main process is responsible for loading the model weights. This can cause process
@@ -596,7 +619,7 @@ class GRPOTrainer(Trainer):
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # Returns a sampler that ensures each prompt is repeated across multiple processes.
         # See _get_train_sampler for an explanation of the sampler.
-        return RepeatRandomSampler(eval_dataset, self.num_generations, seed=self.args.seed)
+        return RepeatRandomSampler(eval_dataset, self.num_eval_generations, seed=self.args.seed)
     
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -870,6 +893,7 @@ class GRPOTrainer(Trainer):
         """
         Generate completions for the given inputs.
         """
+        mode = self.mode
         device = self.accelerator.device
         problems = [example["problem"] for example in inputs]   # raw problems
         prompts = [example["prompt"] for example in inputs]     # raw prompts
@@ -903,13 +927,22 @@ class GRPOTrainer(Trainer):
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                 # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                 # prompt individually.
-                ordered_set_of_prompts = all_prompts_text[::self.num_generations]
+                
                 # vllm generate
+                if mode == 'train':
+                    sampling_params = self.sampling_params
+                    num_generations = self.num_generations
+                else:       # eval mode
+                    sampling_params = self.eval_sampling_params
+                    num_generations = self.num_eval_generations
+
+                ordered_set_of_prompts = all_prompts_text[::num_generations]
                 all_outputs = self.llm.generate(
                     ordered_set_of_prompts, 
-                    sampling_params=self.sampling_params, 
+                    sampling_params=sampling_params, 
                     use_tqdm=False
                 )
+
                 all_completion_ids = []
                 all_completion_texts = []
                 for outputs in all_outputs:
@@ -997,6 +1030,12 @@ class GRPOTrainer(Trainer):
         Score completions for the given input generations.
         """
         mode = self.mode
+        if mode == 'train':
+            num_generations = self.num_generations
+            max_completion_length = self.max_completion_length
+        else:       # eval mode
+            num_generations = self.num_eval_generations
+            max_completion_length = self.max_eval_completion_length
 
         device = self.accelerator.device
         prompts = inputs['prompts']
@@ -1009,10 +1048,10 @@ class GRPOTrainer(Trainer):
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             
-            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
-            else:
-                reward_func_name = reward_func.__name__
+            # if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+            #     reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+            # else:
+            #     reward_func_name = reward_func.__name__
 
             if isinstance(
                 reward_func, nn.Module
@@ -1049,15 +1088,15 @@ class GRPOTrainer(Trainer):
             # eos_idx can indicate the completion length
             eos_idx = inputs['eos_idx']
             all_eos_idx = gather(eos_idx)     # gather from all devices
-            all_rewards = all_rewards * (all_eos_idx < self.max_completion_length).int()
+            all_rewards = all_rewards * (all_eos_idx < max_completion_length).int()
         
         # Compute grouped-wise rewards
-        mean_grouped_rewards = all_rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = all_rewards.view(-1, self.num_generations).std(dim=1)
+        mean_grouped_rewards = all_rewards.view(-1, num_generations).mean(dim=1)
+        std_grouped_rewards = all_rewards.view(-1, num_generations).std(dim=1)
         
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
         
         # Compute advantages
         all_advantages = all_rewards - mean_grouped_rewards
@@ -1070,7 +1109,7 @@ class GRPOTrainer(Trainer):
 
         # Print reward info in the main process
         if self.accelerator.is_main_process:
-            all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
+            all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
 
             if mode == 'train':
                 print()
@@ -1157,6 +1196,12 @@ class GRPOTrainer(Trainer):
         
         # Log completions
         mode = self.mode
+        if mode == 'train':
+            num_generations = self.num_generations
+            max_completion_length = self.max_completion_length
+        else:       # eval mode
+            num_generations = self.num_eval_generations
+            max_completion_length = self.max_eval_completion_length
 
         eos_idx = inputs['eos_idx']
         prompts = inputs['prompts']
@@ -1193,17 +1238,17 @@ class GRPOTrainer(Trainer):
             # When we get the final resutls: res = [[1,1, 1,1], [0,0]],
             #   batch-level mean:               [[1,1, 1,1], [0,0]] -> [1, 0] -> 0.5
             #   unique-sample-level mean: [[1,1, 1,1], [0,0]] -> [1, 1, 0] -> 2/3 = 0.67
-            # This example explains why we use `view(-1, self.num_generations)` below.
+            # This example explains why we use `view(-1, num_generations)` below.
 
             # 1. Log completion length (including truncated completions): mean, min, max
             all_eos_idx = gather(eos_idx)
-            all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
+            all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
             # naive mean/min/max
             # self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
             # self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
             # self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
             # unique-sample-level mean/min/max
-            reshaped = all_completions_length.float().view(-1, self.num_generations)
+            reshaped = all_completions_length.float().view(-1, num_generations)
             self._metrics[mode]["completions/mean_length"].extend(reshaped.mean(-1).tolist())
             self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
             self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
@@ -1214,16 +1259,16 @@ class GRPOTrainer(Trainer):
 
             # the ratio of truncated sequences (completions without EOS)
             # i.e., `eos_idx` is equal to `max_completion_length`
-            # num_truncated = (all_eos_idx == self.max_completion_length).int().sum().item()
+            # num_truncated = (all_eos_idx == max_completion_length).int().sum().item()
             # self._metrics[mode]["completions/truncated_ratio"].append(num_truncated/len(all_completions_length))
-            reshaped = (all_eos_idx == self.max_completion_length).float().view(-1, self.num_generations)
+            reshaped = (all_eos_idx == max_completion_length).float().view(-1, num_generations)
             self._metrics[mode]["completions/truncated_ratio"].extend(reshaped.mean(-1).tolist())
             
             
             # 2. Log rewards
             # log combined reward (e.g., accuracy reward + format reward)
             # self._metrics[mode]["reward"].append(all_rewards.mean().item())
-            reshaped = all_rewards.view(-1, self.num_generations)
+            reshaped = all_rewards.view(-1, num_generations)
             self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
             # self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
@@ -1236,7 +1281,7 @@ class GRPOTrainer(Trainer):
             #         reward_func_name = reward_func.__name__
             #     self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
             
-            rewards_per_func = all_rewards_per_func.view(-1, self.num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
+            rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
             for i, reward_func in enumerate(self.reward_funcs):
                 if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                     reward_func_name = reward_func.config._name_or_path.split("/")[-1]
@@ -1250,6 +1295,7 @@ class GRPOTrainer(Trainer):
             completions_to_log = gather_object(completions_text)
             solutions_to_log = gather_object(solutions_text)
             rewards_to_log = all_rewards.tolist()
+            completion_length_to_log = all_completions_length.tolist()
             
             # Completion table to be logged later
             completion_table = {
@@ -1258,8 +1304,14 @@ class GRPOTrainer(Trainer):
                 "prompt": prompts_to_log,
                 "solution": solutions_to_log,
                 "completion": completions_to_log,
+                "completion_length": completion_length_to_log,
                 "reward": rewards_to_log,
             }
+
+            # # >>>>> add a breakpoint for debug? <<<<<
+            # torch.distributed.breakpoint(rank=0)
+            # # {k: len(v) for k,v in completion_table.items()}
+
             self._completion_examples[mode].append(completion_table)
     
     
@@ -1402,6 +1454,7 @@ class GRPOTrainer(Trainer):
         # mode = "eval" if self.control.should_evaluate else "train"
         mode = self.mode
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        # Note: averaged over unique-samples, so max/min completion length means the averaged value across unique-samples..
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
@@ -1591,7 +1644,9 @@ class GRPOTrainer(Trainer):
             logger.info(f"  Num examples = {self.num_examples(dataloader)}")
         else:
             logger.info("  Num examples: Unknown")
+        logger.info(f"  Num generations = {self.num_eval_generations}")
         logger.info(f"  Batch size = {batch_size}")
+        logger.info(f"  Max completion length  = {self.max_eval_completion_length}")
         
         model.eval()
         if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
@@ -1626,10 +1681,12 @@ class GRPOTrainer(Trainer):
             all_accuracies.extend(all_accuracy)
             
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+            # ref: ProgressCallback.on_prediction_step
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
 
         
         if self.accelerator.is_main_process:
-            all_accuracies = np.array(all_accuracies).reshape(-1, self.num_generations)
+            all_accuracies = np.array(all_accuracies).reshape(-1, self.num_eval_generations)
             # mode = 'eval'
             mode = self.mode
             accs = all_accuracies.mean(-1).tolist()
@@ -1643,12 +1700,12 @@ class GRPOTrainer(Trainer):
             metrics = {}
             # self.log(output.metrics)
             self.log(metrics)
-            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
             
             # logger.info(f"\n***** Eval results *****")
             print(f"\n\n***** Eval results *****")
             print(f"  Accuracy: {all_accuracies.mean()}")
-            
+
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)            
 
 
 

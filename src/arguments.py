@@ -401,7 +401,43 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         },
     )
 
-
+    # Eval parameters
+    num_eval_generations: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of generations to sample. The global batch size (num_processes * per_device_batch_size) "
+            "must be divisible by this value."
+        },
+    )
+    max_eval_completion_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Maximum length of the generated completion."},
+    )
+    eval_temperature: float = field(
+        default=None,
+        metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
+    )
+    eval_top_p: float = field(
+        default=None,
+        metadata={
+            "help": "Float that controls the cumulative probability of the top tokens to consider. Must be in (0, 1]. "
+            "Set to 1.0 to consider all tokens."
+        },
+    )
+    eval_top_k: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, "
+            "top-k-filtering is disabled."
+        },
+    )
+    eval_min_p: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Minimum token probability, which will be scaled by the probability of the most likely token. It "
+            "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range."
+        },
+    )
 
 
 
