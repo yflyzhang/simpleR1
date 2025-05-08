@@ -832,12 +832,12 @@ class GRPOTrainer(Trainer):
 
                     # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
-                        logger.debug(f"[attempt={attempt}]: Current model generation is good.")
+                        logger.debug(f"\n  [attempt={attempt}]: Current model generation is good.")
                         break
                     elif attempt == max_attempts:
-                        logger.warning(f"[attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
+                        logger.warning(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
                     else:
-                        logger.warning(f"[attempt={attempt}]: Current model generation is not good, try again...")
+                        logger.warning(f"\n  [attempt={attempt}]: Current model generation is not good, try again...")
                     
                     # # >>>>> add a breakpoint for debug? <<<<<
                     # torch.distributed.breakpoint(rank=0)                    
@@ -1073,8 +1073,9 @@ class GRPOTrainer(Trainer):
             all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
 
             if mode == 'train':
+                print()
                 logger.debug(
-                    f"\n[{mode}]  global_step={self.state.global_step+1},"
+                    f"\n  [{mode}] global_step={self.state.global_step+1},"
                     f" grpo_iteration={self.grpo_iteration+1},"
                     f" mini_batch (grad. acc.)={self.mini_batch_step+1}"
                     # f"\n  accuracy:            {all_accuracy_reward.cpu().tolist()}, "
@@ -1083,9 +1084,10 @@ class GRPOTrainer(Trainer):
                     f"\n  advantages:         {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
                 )
             else:
-                # accuracy is primary goal!
+                # accuracy is the primary goal!
+                print()
                 logger.debug(
-                    f"\n[{mode}]  global_step={self.state.global_step+1},"
+                    f"\n  [{mode}] global_step={self.state.global_step},"
                     f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
                     f"\n  accuracy reward:    {all_accuracy_reward.cpu().tolist()}"
                     # f"\n  rewards:            {all_rewards.cpu().tolist()}"
@@ -1146,14 +1148,14 @@ class GRPOTrainer(Trainer):
         
         # Only log the first attempt (may change to other values accordingly)
         if attempt == 1:
-            self._log_metrics(inputs, all_rewards_per_func, all_rewards)
+            self._log_completions(inputs, all_rewards_per_func, all_rewards)
         
         return inputs 
         
 
-    def _log_metrics(self, inputs, all_rewards_per_func, all_rewards):
+    def _log_completions(self, inputs, all_rewards_per_func, all_rewards):
         
-        # Log the metrics
+        # Log completions
         mode = self.mode
 
         eos_idx = inputs['eos_idx']
@@ -1183,33 +1185,66 @@ class GRPOTrainer(Trainer):
             self.state.global_step % self.args.logging_steps == 0 and
             self.args.report_to and "wandb" in self.args.report_to
         ):
+            # Note: Log in the unique sample level (num_completions/num_generations), since the last 
+            # batch may not be full (especially for eval dataset) and the averaged values are thus not accurate.
+            # For example, 
+            # suppose we have 3 unique samples, num_generations=2 (6 samples in total)
+            # and batch_size=4 (batch_1 gets 4 samples, bacth_2 gets 2 samples).
+            # When we get the final resutls: res = [[1,1, 1,1], [0,0]],
+            #   batch-level mean:               [[1,1, 1,1], [0,0]] -> [1, 0] -> 0.5
+            #   unique-sample-level mean: [[1,1, 1,1], [0,0]] -> [1, 1, 0] -> 2/3 = 0.67
+            # This example explains why we use `view(-1, self.num_generations)` below.
+
             # 1. Log completion length (including truncated completions): mean, min, max
             all_eos_idx = gather(eos_idx)
             all_completions_length = all_eos_idx + (all_eos_idx < self.max_completion_length).int()
-            # raw_completion_length = (sequence_indices <= eos_idx.unsqueeze(1)).int().sum(1)
-            # all_completions_length = gather(raw_completion_length)
-            self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
-            self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
-            self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
+            # naive mean/min/max
+            # self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
+            # self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
+            # self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
+            # unique-sample-level mean/min/max
+            reshaped = all_completions_length.float().view(-1, self.num_generations)
+            self._metrics[mode]["completions/mean_length"].extend(reshaped.mean(-1).tolist())
+            self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
+            self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
             
+            
+            # # >>>>> add a breakpoint for debug? <<<<<
+            # torch.distributed.breakpoint(rank=0)
+
             # the ratio of truncated sequences (completions without EOS)
             # i.e., `eos_idx` is equal to `max_completion_length`
-            num_truncated = (all_eos_idx == self.max_completion_length).int().sum().item()
-            self._metrics[mode]["completions/truncated_ratio"].append(num_truncated/len(all_completions_length))
+            # num_truncated = (all_eos_idx == self.max_completion_length).int().sum().item()
+            # self._metrics[mode]["completions/truncated_ratio"].append(num_truncated/len(all_completions_length))
+            reshaped = (all_eos_idx == self.max_completion_length).float().view(-1, self.num_generations)
+            self._metrics[mode]["completions/truncated_ratio"].extend(reshaped.mean(-1).tolist())
+            
             
             # 2. Log rewards
             # log combined reward (e.g., accuracy reward + format reward)
-            self._metrics[mode]["reward"].append(all_rewards.mean().item())     # append all mini-batch samples
+            # self._metrics[mode]["reward"].append(all_rewards.mean().item())
+            reshaped = all_rewards.view(-1, self.num_generations)
+            self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
             # self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+
             # log each specific reward (e.g., 1. accuracy reward; 2. format reward)
-            reward_per_func = all_rewards_per_func.mean(0)
+            # reward_per_func = all_rewards_per_func.mean(0)
+            # for i, reward_func in enumerate(self.reward_funcs):
+            #     if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+            #         reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            #     else:
+            #         reward_func_name = reward_func.__name__
+            #     self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+            
+            rewards_per_func = all_rewards_per_func.view(-1, self.num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
             for i, reward_func in enumerate(self.reward_funcs):
                 if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                     reward_func_name = reward_func.config._name_or_path.split("/")[-1]
                 else:
                     reward_func_name = reward_func.__name__
-                self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+                self._metrics[mode][f"rewards/{reward_func_name}"].extend(rewards_per_func[:, i].tolist())
             
+
             # 3. Log concrete completion examples
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
@@ -1388,15 +1423,14 @@ class GRPOTrainer(Trainer):
             )
             wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
         
-        # logs = {**logs, **metrics}      # raw logs + grpo metrics
-        output = {**logs, **metrics}    # raw logs + grpo metrics
+        logs = {**logs, **metrics}      # raw logs + grpo metrics
+        # output = {**logs, **metrics}    # raw logs + grpo metrics
         
         self._metrics[mode].clear()         # reset _metrics for next log
         self._completion_examples[mode].clear()    # reset completion_examples for next log
         
-        self.state.log_history.append(output)
-        self.control = self.callback_handler.on_log(self.args, self.state, self.control, output)
-        # self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+        self.state.log_history.append(logs)
+        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
         
         # Ref: 
         # 1. CallbackHandler.on_log
@@ -1410,19 +1444,19 @@ class GRPOTrainer(Trainer):
         #   https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
         
         # ------------------------------------
-
-    # TODO: under test
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-        # ----------------------------------------
-        self.mode = 'eval'
-        # Prepare grpo inputs: generate and score the completions
-        inputs = self.prepare_grpo_inputs(inputs)
-        # ----------------------------------------
-        with torch.no_grad():
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
-        return loss, None, None
+    
+    # # TODO: under test
+    # def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
+    #     # ----------------------------------------
+    #     self.mode = 'eval'
+    #     # Prepare grpo inputs: generate and score the completions
+    #     inputs = self.prepare_grpo_inputs(inputs)
+    #     # ----------------------------------------
+    #     with torch.no_grad():
+    #         with self.compute_loss_context_manager():
+    #             loss = self.compute_loss(model, inputs)
+    #         loss = loss.mean().detach()
+    #     return loss, None, None
 
     
     # TODO: under test
@@ -1550,8 +1584,9 @@ class GRPOTrainer(Trainer):
         
         
         batch_size = self.args.eval_batch_size
-
-        logger.info(f"\n***** Running {description} *****")
+        
+        print(f"\n\n***** Running {description} *****")
+        # logger.info(f"\n***** Running {description} *****")
         if has_length(dataloader):
             logger.info(f"  Num examples = {self.num_examples(dataloader)}")
         else:
@@ -1571,25 +1606,12 @@ class GRPOTrainer(Trainer):
         
 
         metrics = None
-        eval_set_kwargs = {}
-
-        # Will be useful when we have an iterable dataset so don't know its length.
-        observed_num_examples = 0
         all_accuracies = []
         
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
-            # Update the observed num examples
-            observed_batch_size = find_batch_size(inputs)
-            if observed_batch_size is not None:
-                observed_num_examples += observed_batch_size
-                # For batch samplers, batch_size is not known by the dataloader in advance.
-                if batch_size is None:
-                    batch_size = observed_batch_size
-            
+
             # Prediction step
-            # TODO: rewrite `_generate_score_log_completions` so as to reuse it in evaluate.
-            # should incude original accuracy reward, format reward, etc.
             # losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
             # main_input_name = getattr(self.model, "main_input_name", "input_ids")
             # inputs_decode = (
@@ -1597,19 +1619,17 @@ class GRPOTrainer(Trainer):
             # )
             
             grpo_inputs = self.prepare_grpo_inputs(inputs)
+
+            # Extract useful info from grpo_inputs
+            # For example, to compute accuracy, or pass@k
             all_accuracy = grpo_inputs['accuracy'].tolist()
             all_accuracies.extend(all_accuracy)
             
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
-        num_samples = observed_num_examples
-
+        
         if self.accelerator.is_main_process:
             all_accuracies = np.array(all_accuracies).reshape(-1, self.num_generations)
-
-            logger.info(f"\n***** Eval results *****")
-            print(f"\n  Accuracy: {all_accuracies.mean()}")
-            
             # mode = 'eval'
             mode = self.mode
             accs = all_accuracies.mean(-1).tolist()
@@ -1617,12 +1637,17 @@ class GRPOTrainer(Trainer):
             
             # # >>>>> add a breakpoint for debug? <<<<<
             # torch.distributed.breakpoint(rank=0)
+            # # {k:len(v) for k,v in self._metrics[mode].items()}            
             
-            # {k:len(v) for k,v in self._metrics[mode].items()}
-
-            # call log
+            # log the metrics
+            metrics = {}
             # self.log(output.metrics)
-            self.log(logs={})
+            self.log(metrics)
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+            
+            # logger.info(f"\n***** Eval results *****")
+            print(f"\n\n***** Eval results *****")
+            print(f"  Accuracy: {all_accuracies.mean()}")
             
 
 
