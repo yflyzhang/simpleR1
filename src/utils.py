@@ -35,6 +35,24 @@ def init_wandb_training(training_args):
         os.environ["WANDB_PROJECT"] = training_args.wandb_project
 
 
+#####################
+# Check if messages
+#####################
+# Adapted from: https://github.com/huggingface/trl/blob/v0.15.1/trl/data_utils.py#L24
+def is_messages(examples):
+    # examples = [
+    #     {"role": "user", "content": "What color is the sky?"},
+    #     {"role": "assitant", "content": "The sky is blue."}
+    # ]
+    # It must be a list of messages.
+    if isinstance(examples, list):
+        maybe_message = examples[0]
+        # Each message must a list of dictionaries with keys "role" and "content"
+        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
+            return True
+    return False
+
+
 ##################
 # Get tokenizer
 ##################

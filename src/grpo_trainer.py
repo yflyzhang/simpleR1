@@ -89,7 +89,7 @@ if is_wandb_available():
     import wandb
 
 
-
+from utils import is_messages
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -357,7 +357,8 @@ class GRPOTrainer(Trainer):
         self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
         self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
-        
+        self.loss_type = args.loss_type
+
         # Clip higher
         self.epsilon = args.epsilon                 # clip value (pi_theta/pi_old)
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
@@ -763,19 +764,8 @@ class GRPOTrainer(Trainer):
             self.args.torch_empty_cache_steps is not None
             and self.state.global_step % self.args.torch_empty_cache_steps == 0
         ):
-            if is_torch_xpu_available():
-                torch.xpu.empty_cache()
-            elif is_torch_mlu_available():
-                torch.mlu.empty_cache()
-            elif is_torch_musa_available():
-                torch.musa.empty_cache()
-            elif is_torch_npu_available():
-                torch.npu.empty_cache()
-            elif is_torch_mps_available(min_version="2.0"):
-                torch.mps.empty_cache()
-            else:
-                torch.cuda.empty_cache()
-
+            torch.cuda.empty_cache()
+        
         kwargs = {}
 
         # For LOMO optimizers you need to explicitly use the learnign rate
@@ -999,9 +989,9 @@ class GRPOTrainer(Trainer):
             completions = []
             for prompt, completion in zip(prompts, completions_text):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                # completions.append([{"role": "assistant", "content": bootstrap + completion}])
-                completions.append({"role": "assistant", "content": bootstrap + completion})    # single turn
-        else: 
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])  # multi-turn support
+                # completions.append({"role": "assistant", "content": bootstrap + completion})    # single-turn only
+        else:
             completions = completions_text
 
         # # >>>>> add a breakpoint for debug? <<<<<
@@ -1052,11 +1042,12 @@ class GRPOTrainer(Trainer):
             #     reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
             # else:
             #     reward_func_name = reward_func.__name__
-
+            
             if isinstance(
                 reward_func, nn.Module
             ):  # Module instead of PretrainedModel for compat with compiled models
-                if is_conversational(inputs[0]):
+                # if is_conversational(inputs[0]):    
+                if is_messages(completions[0]): # to be verified here
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
@@ -1103,10 +1094,10 @@ class GRPOTrainer(Trainer):
         if self.scale_rewards:
             all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
         
-        # Get accuracy reward
-        # Note: by default, the first reward functions should be the accuracy reward
+        # Get accuracy reward (i.e., the primary reward)
+        # Note: by default, the first reward function is the accuracy reward.
         all_accuracy_reward = all_rewards_per_func[:, 0]
-
+        
         # Print reward info in the main process
         if self.accelerator.is_main_process:
             all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
@@ -1131,7 +1122,7 @@ class GRPOTrainer(Trainer):
                     f"\n  accuracy reward:    {all_accuracy_reward.cpu().tolist()}"
                     # f"\n  rewards:            {all_rewards.cpu().tolist()}"
                 )
-            
+        
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
@@ -1178,7 +1169,7 @@ class GRPOTrainer(Trainer):
         inputs['rewards'] = all_rewards     # to check model generation
 
         # Get accuracy reward
-        # Note: by default, the first reward functions should be the accuracy reward
+        # Note: by default, the first reward function is the accuracy reward.
         all_accuracy_reward = all_rewards_per_func[:, 0]
         inputs['accuracy'] = all_accuracy_reward     # accuracy
         
@@ -1207,7 +1198,7 @@ class GRPOTrainer(Trainer):
         prompts = inputs['prompts']
         completions = inputs['completions']
         # solutions = inputs['solutions']
-
+        
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
@@ -1215,12 +1206,15 @@ class GRPOTrainer(Trainer):
         prompts_text = [
             maybe_apply_chat_template({'prompt': p}, self.processing_class)['prompt'] for p in prompts
         ]
-        # Completion text (may extract from message dict)
-        maybe_message = completions[0]
-        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-            completions_text = [example['content'] for example in completions]
+        # Completion text (may extract from conversational message)
+        # maybe_message = completions[0][0]
+        # if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
+        if is_messages(completions[0]):
+            completions_text = [example[0]['content'] for example in completions]
+            # completions_text = [example['content'] for example in completions]
         else:
             completions_text = completions
+        
         # Raw solution text (gold) (may change it to answer only?)
         solutions_text = inputs['solutions']
         
@@ -1395,16 +1389,24 @@ class GRPOTrainer(Trainer):
         # To mitigate this, consider to use 'completion_mask.sum().clamp(min=1.0)' as the divisor (or other appropriate operations) 
         # instead of merely 'completion_mask.sum()' which may result in nan with 0 as the divisor.
         
-        # Token-level loss:
-        # Longer sequences can have more influence on the overall gradient update, 
-        # but particular generation pattern may help to train the model regardless of the response length.
-        # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        # Remove length bias by using masked_sum with a constant normalizer (ref: Dr. GRPO)
-        loss = (per_token_loss * completion_mask).sum() / self.max_completion_length
-
         # Sequence-level loss: 
-        # Each sequence has an equal weight in the final loss computation
-        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        if self.loss_type == "grpo":
+            # Each sequence has an equal weight in the final loss computation
+            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+        
+        # Token-level loss:
+        elif self.loss_type == "bnpo":
+            # Longer sequences can have more influence on the overall gradient update, but 
+            # particular generation pattern may help to train the model regardless of the response length.
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        
+        # Remove length bias by using masked_sum with a constant normalizer (ref: Dr. GRPO)
+        elif self.loss_type == "dr_grpo":
+            loss = (per_token_loss * completion_mask).sum() / self.max_completion_length
+            # loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+        
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
         
         # Log the metrics
         # mode = "eval" if self.control.should_evaluate else "train"
@@ -1497,8 +1499,9 @@ class GRPOTrainer(Trainer):
         #   https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
         
         # ------------------------------------
-
     
+
+    # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4086
     # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
     def evaluate(
         self,
@@ -1584,17 +1587,16 @@ class GRPOTrainer(Trainer):
         #     ignore_keys=ignore_keys,
         #     metric_key_prefix=metric_key_prefix,
         # )
-
-        #    https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L4205
+        
+        # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L4205
+        # def evaluation_loop()
         """
         Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
         Works both with or without labels.
         """
+
         description="Evaluation"
         args = self.args
-        
-        prediction_loss_only=True if self.compute_metrics is None else None,
-        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
         # if eval is called w/o train, handle model prep here
         if self.is_deepspeed_enabled and self.deepspeed is None:
@@ -1622,13 +1624,21 @@ class GRPOTrainer(Trainer):
             if self.is_deepspeed_enabled:
                 self.deepspeed = self.model_wrapped
         
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
         
         batch_size = self.args.eval_batch_size
         
         print(f"\n\n***** Running {description} *****")
         # logger.info(f"\n***** Running {description} *****")
+        logger.info(f"  ***** Parameters*****")
         if has_length(dataloader):
-            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+            logger.info(f"  Num examples (raw) = {self.num_examples(dataloader)}")
         else:
             logger.info("  Num examples: Unknown")
         logger.info(f"  Num generations = {self.num_eval_generations}")
@@ -1646,7 +1656,9 @@ class GRPOTrainer(Trainer):
         if args.past_index >= 0:
             self._past = None
         
-
+        # >>> continue from here
+        
+        # Initialize containers/metrics
         metrics = None
         all_accuracies = []
         

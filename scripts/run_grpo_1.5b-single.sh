@@ -73,13 +73,13 @@ src/run_grpo.py \
     --per_device_eval_batch_size 64 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
-    --max_num_train_samples 10000 \
-    --max_num_test_samples 50 \
+    --max_num_train_samples 1000 \
+    --max_num_test_samples 20 \
     --max_completion_length 2048 \
     --max_eval_completion_length 3600 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
-    --scale_rewards True \
+    --scale_rewards False \
     --mask_truncated_completions True \
     --epsilon 0.2 \
     --epsilon_high 0.3 \
@@ -89,7 +89,7 @@ src/run_grpo.py \
     --eval_top_p 0.95 \
     --beta 0.0001 \
     --compute_kl True \
-    --learning_rate 1e-6 \
+    --learning_rate 5e-6 \
     --save_strategy steps \
     --eval_strategy steps \
     --eval_steps 10 \

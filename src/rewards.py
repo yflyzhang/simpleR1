@@ -31,17 +31,25 @@ if is_e2b_available():
     load_dotenv()
 
 
+from utils import is_messages
 
-# https://github.com/huggingface/trl/blob/v0.15.1/trl/data_utils.py#L24
-def _is_conversational(examples):
-    # examples = [{"role": "user", "content": "What color is the sky?"}]
-    # It must be a list of messages,
-    if isinstance(examples, list):
-        maybe_message = examples[0]
-        # Each message must a list of dictionaries with keys "role" and "content"
-        if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
-            return True
-    return False
+# #####################
+# # Check if messages
+# #####################
+# # Adapted from: https://github.com/huggingface/trl/blob/v0.15.1/trl/data_utils.py#L24
+# def is_messages(examples):
+#     # examples = [
+#     #     {"role": "user", "content": "What color is the sky?"},
+#     #     {"role": "assitant", "content": "The sky is blue."}
+#     # ]
+#     # It must be a list of messages.
+#     if isinstance(examples, list):
+#         maybe_message = examples[0]
+#         # Each message must a list of dictionaries with keys "role" and "content"
+#         if isinstance(maybe_message, dict) and "role" in maybe_message and "content" in maybe_message:
+#             return True
+#     return False
+
 
 
 def accuracy_reward(completions, solutions, **kwargs):
@@ -78,10 +86,11 @@ def accuracy_reward(completions, solutions, **kwargs):
                 - A list of any of the above
             target: The expression(s) to verify. Same types as gold.
             precision: Number of decimal places to consider for numeric comparisons. Defaults to 6.
-
     """
-    if _is_conversational(completions):
-        completions = [completion["content"] for completion in completions]
+    
+    if is_messages(completions[0]):     # message format
+        completions = [example[0]["content"] for example in completions]
+        # completions = [example["content"] for example in completions]
     rewards = []
     for completion_to_parse, gold_to_parse in zip(completions, solutions):
         
@@ -138,46 +147,32 @@ def accuracy_reward(completions, solutions, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    
+    # Completion text (may extract from conversional completions)
+    if is_messages(completions[0]):
+        # message format and only one completion each
+        completions_text = [example[0]['content'] for example in completions]
+        # completions_text = [example['content'] for example in completions]
+    else:
+        completions_text = completions
+    
     # pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     # pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
     # Allow `\s`, `\n`, `\t` before `<think>` and after `</answer>`?
     pattern = r"^[\s]*<think>.+?</think>[\s]*<answer>.+?</answer>[\s]*$"
-    completion_contents = [completion["content"] for completion in completions]
+    
     # Multiline mode:  `$`` may match the end of each line instead of the end of the entire string
-    # matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+    # matches = [re.match(pattern, text, re.DOTALL | re.MULTILINE) for text in completions_text]
+    
     # Match the end of the entire string instead of the end of each line
-    matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
+    matches = [re.match(pattern, text, re.DOTALL) for text in completions_text]
+    
     return [1.0 if match else 0.0 for match in matches]
 
 
-# def format_reward(completions, **kwargs):
-#     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-#     # Allow `\s`, `\n`, `\t` before `<think>` and after `</answer>`?
-#     # Strict pattern: get full reward
-#     strict_pattern = r"^[\s]*<think>.+?</think>[\s]*<answer>.+?</answer>[\s]*$"
-#     # Loose pattern: get partial reward
-#     loose_pattern = r"^[\s]*<think>.+?</think>.*?<answer>.+?</answer>[\s]*$"
-#     # loose_pattern = r"<think>.+?</think>.*?<answer>.+?</answer>"
-    
-#     rewards = []
-#     for completion in completions:
-#         content = completion["content"]
-#         # Go strict first
-#         if re.match(strict_pattern, content, re.DOTALL | re.MULTILINE):
-#             rewards.append(1.0)     # get full reward
-#         elif re.match(loose_pattern, content, re.DOTALL | re.MULTILINE):
-#             rewards.append(0.5)     # get partial reward (can be set as other values)
-#         else:
-#             rewards.append(0.0)     # get no reward
-#     return rewards
-
-
 def tag_count_reward(completions, **kwargs) -> list[float]:
-    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
-
-    Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
-    """
-
+    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`."""
+    
     def count_tags(text: str) -> float:
         count = 0.0
         if text.count("<think>") == 1:
@@ -190,8 +185,16 @@ def tag_count_reward(completions, **kwargs) -> list[float]:
             count += 0.25
         return count
     
-    contents = [completion["content"] for completion in completions]
-    return [count_tags(c) for c in contents]
+    # Completion text (may extract from conversional completions)
+    if is_messages(completions[0]):
+        # message format and only one completion each
+        completions_text = [example[0]['content'] for example in completions]
+        # completions_text = [example['content'] for example in completions]
+    else:
+        completions_text = completions
+    
+    return [count_tags(text) for text in completions_text]
+
 
 
 def reasoning_steps_reward(completions, **kwargs):
@@ -212,7 +215,7 @@ def reasoning_steps_reward(completions, **kwargs):
 
 
 
-# TODO: parse and verify needs to be fixed in the following reward functions!
+# Note: parse and verify need to be checked in the following reward functions!
 
 def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
