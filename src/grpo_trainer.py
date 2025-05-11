@@ -336,7 +336,7 @@ class GRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.temperature = args.temperature
 
-        # Eval parameters
+        # Eval arguments
         # If not explicitly specified, use parameters from training mode
         self.num_eval_generations = args.num_eval_generations if args.num_eval_generations is not None else args.num_generations
         self.max_eval_completion_length = args.max_eval_completion_length if args.max_eval_completion_length is not None else args.max_completion_length
@@ -344,10 +344,9 @@ class GRPOTrainer(Trainer):
         self.eval_top_p = args.eval_top_p if args.eval_top_p is not None else args.top_p
         self.eval_top_k = args.eval_top_k if args.eval_top_k is not None else args.top_k
         self.eval_min_p = args.eval_min_p if args.eval_min_p is not None else args.min_p
-
-
+        
         self.use_vllm = args.use_vllm
-
+        
         # Multi-step
         self.num_iterations = args.num_iterations   # = 𝜇 in the GRPO paper
         # --------------------------
@@ -412,7 +411,8 @@ class GRPOTrainer(Trainer):
             )
         if self.args.eval_strategy != "no":
             effective_batch_size = args.per_device_eval_batch_size * num_processes
-            possible_values = [n_gen for n_gen in range(2, effective_batch_size + 1) if (effective_batch_size) % n_gen == 0]
+            possible_values = [n_gen for n_gen in range(1, effective_batch_size + 1) if (effective_batch_size) % n_gen == 0]
+            # Note: possible_values can start from 1 in eval mode.
             if self.num_eval_generations not in possible_values:
                 raise ValueError(
                     f"The effective eval batch size ({num_processes} x {args.per_device_eval_batch_size}) must be evenly "
@@ -595,8 +595,8 @@ class GRPOTrainer(Trainer):
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
         
-        # In the following figure, the values are the prompt indices. The first row shows the first sampled mini-batch, 
-        # the second row shows the second sampled mini-batch, and so on.
+        # In the following illustration, values are the prompt indices. The first row indictaes the first sampled mini-batch, 
+        # the second row indicates the second sampled mini-batch, and so on.
         #
         #                                                 |     GPU 0     |     GPU 1     |     GPU 2    |
         #                            grpo
@@ -721,7 +721,6 @@ class GRPOTrainer(Trainer):
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
         
     
-    # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3668
     def training_step(
         self, model: nn.Module, inputs: list[str, Union[torch.Tensor, Any]], num_items_in_batch=None
     ) -> torch.Tensor:
@@ -741,6 +740,9 @@ class GRPOTrainer(Trainer):
 
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
+
+        Ref: 
+            https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3668
         """
         model.train()
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
@@ -817,7 +819,7 @@ class GRPOTrainer(Trainer):
             return False
         
         # TODO: 
-        # Check other conditions, e.g., entropy
+        # Check other conditions, e.g., generation diversity, entropy
         
         return True
     
@@ -827,7 +829,7 @@ class GRPOTrainer(Trainer):
         inputs: list[str, Union[torch.Tensor, Any]],
     ) -> dict[str, Union[torch.Tensor, Any]]:
         """
-        Prepare `inputs` before feeding them to the model 
+        Prepare grpo `inputs` before feeding them to the model
         """
         
         mode = self.mode
@@ -1017,7 +1019,7 @@ class GRPOTrainer(Trainer):
     
     def _score_completions(self, inputs):
         """
-        Score completions for the given input generations.
+        Score completions for the given generations.
         """
         mode = self.mode
         if mode == 'train':
@@ -1074,11 +1076,12 @@ class GRPOTrainer(Trainer):
         # Apply weights to each reward function's output and sum
         all_rewards = (all_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
         
+        # eos_idx can indicate the completion length
+        eos_idx = inputs['eos_idx']
+        all_eos_idx = gather(eos_idx)     # gather from all devices
+
         # If mask_truncated_completions is enabled, zero out rewards of truncated completions
         if self.mask_truncated_completions:
-            # eos_idx can indicate the completion length
-            eos_idx = inputs['eos_idx']
-            all_eos_idx = gather(eos_idx)     # gather from all devices
             all_rewards = all_rewards * (all_eos_idx < max_completion_length).int()
         
         # Compute grouped-wise rewards
@@ -1167,8 +1170,8 @@ class GRPOTrainer(Trainer):
         advantages = all_advantages[start:start+len(inputs['prompt_ids'])]      # [i:i+len(prompts)]
         inputs['advantages'] = advantages   # to compute loss
         inputs['rewards'] = all_rewards     # to check model generation
-
-        # Get accuracy reward
+        
+        # Get specific reward, for example, accuracy, based on which we can get additional metrics such as pass@k.
         # Note: by default, the first reward function is the accuracy reward.
         all_accuracy_reward = all_rewards_per_func[:, 0]
         inputs['accuracy'] = all_accuracy_reward     # accuracy
@@ -1184,8 +1187,7 @@ class GRPOTrainer(Trainer):
         
 
     def _log_completions(self, inputs, all_rewards_per_func, all_rewards):
-        
-        # Log completions
+        """Log completions in the log buffer."""
         mode = self.mode
         if mode == 'train':
             num_generations = self.num_generations
@@ -1283,7 +1285,6 @@ class GRPOTrainer(Trainer):
                     reward_func_name = reward_func.__name__
                 self._metrics[mode][f"rewards/{reward_func_name}"].extend(rewards_per_func[:, i].tolist())
             
-
             # 3. Log concrete completion examples
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
@@ -1292,8 +1293,11 @@ class GRPOTrainer(Trainer):
             completion_length_to_log = all_completions_length.tolist()
             
             # Completion table to be logged later
+            global_step = self.state.global_step
+            if mode == 'train':
+                global_step += 1
             completion_table = {
-                "global_step": [self.state.global_step+1] * len(rewards_to_log),
+                "global_step": [global_step] * len(rewards_to_log),
                 "mini_batch": [self.mini_batch_step+1] * len(rewards_to_log),
                 "prompt": prompts_to_log,
                 "solution": solutions_to_log,
@@ -1310,7 +1314,7 @@ class GRPOTrainer(Trainer):
     
     
     def _get_batch_logps(self, prompt_completion_ids, attention_mask, logits_to_keep):
-        
+        """Get the per-token log probabilities of completions under the training model and the reference model"""
         with torch.no_grad():
             # If num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
@@ -1336,8 +1340,8 @@ class GRPOTrainer(Trainer):
         return old_per_token_logps, ref_per_token_logps
     
     
-    # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        """Get the per-token log probabilities of the under the given model"""
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
@@ -1443,6 +1447,10 @@ class GRPOTrainer(Trainer):
                 The values to log.
             start_time (`Optional[float]`):
                 The start of training.
+        
+        Ref:
+        Trainer.log(): 
+            https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L3631
         """
         
         if self.state.epoch is not None:
@@ -1500,9 +1508,7 @@ class GRPOTrainer(Trainer):
         
         # ------------------------------------
     
-
-    # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4086
-    # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
+    
     def evaluate(
         self,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
@@ -1546,6 +1552,10 @@ class GRPOTrainer(Trainer):
         Returns:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
+        
+        Ref:
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4086
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
         """
         
         self.mode = 'eval'
@@ -1634,17 +1644,20 @@ class GRPOTrainer(Trainer):
         
         batch_size = self.args.eval_batch_size
         
-        print(f"\n\n***** Running {description} *****")
-        # logger.info(f"\n***** Running {description} *****")
-        logger.info(f"  ***** Parameters*****")
+        logger.info("\n\n***** Evaluate *****")
+        logger.info(f"***** Running {description} *****")
         if has_length(dataloader):
-            logger.info(f"  Num examples (raw) = {self.num_examples(dataloader)}")
+            num_examples = self.num_examples(dataloader)
+            logger.info(f"  Num examples (raw) = {num_examples}")
         else:
             logger.info("  Num examples: Unknown")
         logger.info(f"  Num generations = {self.num_eval_generations}")
         logger.info(f"  Batch size = {batch_size}")
+        if has_length(dataloader):
+            num_update_steps_per_epoch = math.ceil(num_examples * self.num_eval_generations / batch_size)
+            logger.info(f"  Num updates per epoch = {num_update_steps_per_epoch}")
         logger.info(f"  Max completion length  = {self.max_eval_completion_length}")
-        
+
         model.eval()
         if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
             self.optimizer.eval()
@@ -1656,60 +1669,86 @@ class GRPOTrainer(Trainer):
         if args.past_index >= 0:
             self._past = None
         
-        # >>> continue from here
-        
         # Initialize containers/metrics
-        metrics = None
+        metrics = {}
         all_accuracies = []
         
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
 
             # Prediction step
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4487
             # losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
             # main_input_name = getattr(self.model, "main_input_name", "input_ids")
             # inputs_decode = (
             #     self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
             # )
             
+            # Prediction step: prepare grpo inputs
+            # generate, score, and log completions (`_generate_score_log_completions` in eval mode)
             grpo_inputs = self.prepare_grpo_inputs(inputs)
-
-            # Extract useful info from grpo_inputs
-            # For example, to compute accuracy, or pass@k
-            all_accuracy = grpo_inputs['accuracy'].tolist()
-            all_accuracies.extend(all_accuracy)
+            
+            # # Extract useful info from grpo_inputs
+            # # It may help to compute additional metrics, e.g., pass@k, but this can also be done 
+            # # during/after `_score_completions`.
+            # # This is only a demo of what we can do to compute the accuracy. 
+            # all_accuracy = grpo_inputs['accuracy'].tolist()
+            # all_accuracies.extend(all_accuracy)
             
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
             # ref: ProgressCallback.on_prediction_step
             # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
+            
+            del inputs, grpo_inputs
+            torch.cuda.empty_cache()
+        
 
+        # After all calls to `.gather_function`, reset to `gather_for_metrics`:
+        self.gather_function = self.accelerator.gather_for_metrics
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+        
+        # total_batch_size = self.args.eval_batch_size * self.args.world_size
+        # metrics.update(
+        #     speed_metrics(
+        #         metric_key_prefix,
+        #         start_time,
+        #         num_samples=num_samples,
+        #         num_steps=math.ceil(num_samples / total_batch_size),
+        #     )
+        # )
         
         if self.accelerator.is_main_process:
-            # Compute custom metrics
-            all_accuracies = np.array(all_accuracies).reshape(-1, self.num_eval_generations)
-            # mode = 'eval'
-            mode = self.mode
-            accs = all_accuracies.mean(-1).tolist()
-            self._metrics[mode][f"accuracy"].extend(accs)
-            
-            # # >>>>> add a breakpoint for debug? <<<<<
-            # torch.distributed.breakpoint(rank=0)
-            # # {k:len(v) for k,v in self._metrics[mode].items()}            
-            
-            # log the metrics
-            metrics = {}
-            # self.log(output.metrics)
-            self.log(metrics)
-            
-            # logger.info(f"\n***** Eval results *****")
-            print(f"\n\n***** Eval results *****")
-            print(f"  Accuracy: {all_accuracies.mean()}")
-
-            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)            
-
-
-
-    # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L2140
+            mode = 'eval'
+            for k, v in self._metrics[mode].items():
+                if k.startswith('rewards/'):
+                    reward_name = k[len('rewards/'):]
+                    metrics[f'{mode}_{reward_name}'] = np.mean(v)
+                    
+                    # Check if accuracy is available
+                    if reward_name == "accuracy_reward":
+                        print(f"\n\n***** Eval results *****")
+                        print(f"  accuracy/avg@{self.num_eval_generations}: {np.mean(v)}")
+                    # Note: To save the best model checkpoint, i.e., `save_strategy` is best,
+                    # 'args.metric_for_best_model' can be set to 'eval_accuracy_reward'.
+        
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+    
+        # self.log(metrics)
+        self.log({})
+        
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)       
+        
+        self._memory_tracker.stop_and_update_metrics(metrics)
+        
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+        
+        return metrics
+    
+    
     def train(
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
@@ -1717,6 +1756,7 @@ class GRPOTrainer(Trainer):
         ignore_keys_for_eval: Optional[list[str]] = None,
         **kwargs,
     ):
+        # Trainer.train: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L2139
         """
         Main training entry point.
 
@@ -1946,8 +1986,8 @@ class GRPOTrainer(Trainer):
         logger.info("***** Running training *****")
         logger.info(f"  Num epochs = {num_train_epochs:,}")
         logger.info(f"  Num examples (raw train dataset) = {num_examples:,}")
-        logger.info(f"  Num examples (w. num_generations) = {num_examples*self.num_generations:,}")
         logger.info(f"  Num generations = {self.num_generations:,}")
+        logger.info(f"  Num examples (w. num_generations) = {num_examples*self.num_generations:,}")
         logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
         logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
         logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
@@ -2310,14 +2350,13 @@ class GRPOTrainer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
-
-        
-    # Overwrite `set_initial_training_values` as it's not accurate in estimating: 
-    # - num_update_steps_per_epoch
-    # - num_train_samples
+    
     def set_initial_training_values(
         self, args: 'TrainingArguments', train_dataloader: 'DataLoader', total_train_batch_size: int
     ):
+        # Overwrite `set_initial_training_values` as it's not accurate in estimating: 
+        # - num_update_steps_per_epoch
+        # - num_train_samples
         """
         Calculates and returns the following values:
         - `num_train_epochs`

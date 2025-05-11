@@ -5,10 +5,10 @@ model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B-Instruct
 # model_name_or_path=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-model_name_or_path=Qwen/Qwen3-1.7B
+# model_name_or_path=Qwen/Qwen3-1.7B
 
 
-train_dataset=openai/gsm8k
+# train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
 # train_dataset=SynthLabsAI/Big-Math-RL-Verified
@@ -19,7 +19,9 @@ train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=RUC-AIBOX/STILL-3-Preview-RL-Data
 # train_dataset=Maxwell-Jia/AIME_2024
 
+
 eval_dataset=HuggingFaceH4/MATH-500
+# eval_dataset=opencompass/AIME2025
 
 
 model_name=$(basename $model_name_or_path)
@@ -50,6 +52,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # export CUDA_VISIBLE_DEVICES=0,1,2
 export CUDA_VISIBLE_DEVICES=2
+export TOKENIZERS_PARALLELISM=false
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 
 accelerate launch \
@@ -65,20 +68,21 @@ src/run_grpo.py \
     --use_vllm True \
     --vllm_gpu_memory_utilization 0.2 \
     --num_train_epochs 1 \
-    --num_generations 6 \
-    --num_eval_generations 16 \
+    --num_generations 7 \
+    --num_eval_generations 1 \
+    --per_device_train_batch_size 7 \
+    --per_device_eval_batch_size 64 \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 3 \
-    --per_device_train_batch_size 6 \
-    --per_device_eval_batch_size 64 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 1000 \
-    --max_num_test_samples 20 \
+    --max_num_test_samples -1 \
     --max_completion_length 2048 \
-    --max_eval_completion_length 3600 \
+    --max_eval_completion_length 4096 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
+    --loss_type bnpo \
     --scale_rewards False \
     --mask_truncated_completions True \
     --epsilon 0.2 \
@@ -89,8 +93,9 @@ src/run_grpo.py \
     --eval_top_p 0.95 \
     --beta 0.0001 \
     --compute_kl True \
-    --learning_rate 5e-6 \
+    --learning_rate 3e-6 \
     --save_strategy steps \
+    --save_steps 100 \
     --eval_strategy steps \
     --eval_steps 10 \
     --eval_on_start True \

@@ -400,12 +400,12 @@ class GRPOTrainingArguments(trl.GRPOConfig):
             "a good practice for training stability."
         },
     )
-    
+
     loss_type: str = field(
         default="bnpo",
         metadata={
             "help": "Specifies the loss formulation to use. Supported values are `grpo`, `bnpo`, and `dr_grpo`. "
-            "`'grpo'`: Aggregates token-level losses by normalizing over sequence length. Not recommended due to "
+            "`'grpo'`: Aggregates sequence-level losses by normalizing over sequence length. Not recommended due to "
                 "length bias—this approach tends to prefer shorter completions with positive advantages and longer ones "
                 "with negative advantages. "
             "`'bnpo'`: Aggregates token-level losses by normalizing number of active token in the local batch. "
