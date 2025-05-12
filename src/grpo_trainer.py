@@ -1266,8 +1266,10 @@ class GRPOTrainer(Trainer):
             # self._metrics[mode]["reward"].append(all_rewards.mean().item())
             reshaped = all_rewards.view(-1, num_generations)
             self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
-            # self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
-
+            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                # reward std: enabled when num_generations > 1
+                self._metrics[mode]["reward_std"].extend(reshaped.std(-1).tolist())
+            
             # log each specific reward (e.g., 1. accuracy reward; 2. format reward)
             # reward_per_func = all_rewards_per_func.mean(0)
             # for i, reward_func in enumerate(self.reward_funcs):
@@ -1277,13 +1279,23 @@ class GRPOTrainer(Trainer):
             #         reward_func_name = reward_func.__name__
             #     self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
             
-            rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
+            mean_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
+            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                # reward std: enabled when num_generations > 1
+                std_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).std(1)
             for i, reward_func in enumerate(self.reward_funcs):
                 if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                     reward_func_name = reward_func.config._name_or_path.split("/")[-1]
                 else:
                     reward_func_name = reward_func.__name__
-                self._metrics[mode][f"rewards/{reward_func_name}"].extend(rewards_per_func[:, i].tolist())
+                # mean of each reward
+                self._metrics[mode][f"rewards/{reward_func_name}"].extend(mean_rewards_per_func[:, i].tolist())
+                # std of each reward
+                if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                    self._metrics[mode][f"rewards/{reward_func_name}_std"].extend(std_rewards_per_func[:, i].tolist())
+                
+                # # >>>>> add a breakpoint for debug? <<<<<
+                # torch.distributed.breakpoint(rank=0)
             
             # 3. Log concrete completion examples
             prompts_to_log = gather_object(prompts_text)
@@ -1724,7 +1736,7 @@ class GRPOTrainer(Trainer):
             for k, v in self._metrics[mode].items():
                 if k.startswith('rewards/'):
                     reward_name = k[len('rewards/'):]
-                    metrics[f'{mode}_{reward_name}'] = np.mean(v)
+                    metrics[f'{mode}_{reward_name}'] = np.mean(v)   # similar to `compute_metrics`
                     
                     # Check if accuracy is available
                     if reward_name == "accuracy_reward":
@@ -1732,10 +1744,18 @@ class GRPOTrainer(Trainer):
                         print(f"  accuracy/avg@{self.num_eval_generations}: {np.mean(v)}")
                     # Note: To save the best model checkpoint, i.e., `save_strategy` is best,
                     # 'args.metric_for_best_model' can be set to 'eval_accuracy_reward'.
-        
+            
+            # TODO: why not record all available eval results?
+            # metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+            # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+            # # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+            # if mode == "eval":
+            #     metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            
+
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
-    
+        
         # self.log(metrics)
         self.log({})
         

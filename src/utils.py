@@ -87,6 +87,8 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
 
     if dataset_name == 'openai/gsm8k':
         dataset = load_dataset(dataset_name, name='main', split=split)
+    elif dataset_name == 'opencompass/AIME2025':
+        dataset = load_dataset(dataset_name, name='AIME2025-I', split=split)
     else:
         dataset = load_dataset(dataset_name, split=split)
     
