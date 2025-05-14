@@ -27,7 +27,6 @@ eval_dataset=HuggingFaceH4/MATH-500
 model_name=$(basename $model_name_or_path)
 # run_name=$model_name-$(date +%Y-%m-%d)
 run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
-# run_name=$model_name+
 
 
 OUTPUT_DIR=outputs/models/$run_name
@@ -106,6 +105,5 @@ src/run_grpo.py \
 
     
     
-    # --seed 95 \
-    
+
 
