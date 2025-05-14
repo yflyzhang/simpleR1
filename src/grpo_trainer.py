@@ -1132,7 +1132,7 @@ class GRPOTrainer(Trainer):
         if self.scale_rewards:
             all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
         
-        # Get accuracy reward (i.e., the primary reward)
+        # Get the primary reward (i.e., accuracy reward)
         # Note: by default, the first reward function is the accuracy reward.
         all_accuracy_reward = all_rewards_per_func[:, 0]
         
@@ -1172,8 +1172,8 @@ class GRPOTrainer(Trainer):
         )
         # Note: 
         # all_rewards_per_func: tracks the the raw reward (0.0-1.0) for each reward function.
-        # all_rewards: is the weighted sum of all_rewards_per_func and may apply mask_truncated_completions then.
-
+        # all_rewards: is the weighted sum of all_rewards_per_func and may be applied mask_truncated_completions then.
+    
 
 
     def _generate_score_log_completions(
