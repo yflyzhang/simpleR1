@@ -278,9 +278,11 @@ def main():
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
         metrics["eval_samples"] = len(eval_dataset)
-        trainer.log_metrics("eval", metrics)
+        # trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     
+    # # >>>>> add a breakpoint for debug? <<<<<
+    # torch.distributed.breakpoint(rank=0)
 
 if __name__ == "__main__":
     main()
