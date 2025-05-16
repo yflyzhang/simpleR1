@@ -28,6 +28,7 @@ from unittest.mock import patch
 
 
 import pandas as pd
+import gc
 # --------------------------------
 from transformers.trainer import *
 
@@ -770,6 +771,8 @@ class GRPOTrainer(Trainer):
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
 
         del inputs
+        gc.collect()
+
         if (
             self.args.torch_empty_cache_steps is not None
             and self.state.global_step % self.args.torch_empty_cache_steps == 0
@@ -868,7 +871,7 @@ class GRPOTrainer(Trainer):
 
                     # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
-                        logger.debug(f"\n  [attempt={attempt}]: Current model generation is good.")
+                        logger.info(f"\n  [attempt={attempt}]: Current model generation is good.")
                         break
                     elif attempt == max_attempts:
                         logger.warning(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
@@ -1054,7 +1057,7 @@ class GRPOTrainer(Trainer):
                 List of input batched data.
         
         Return:
-            `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`.
+            `tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, None]]`.
         """
         mode = self.mode
         if mode == 'train':
@@ -1119,18 +1122,21 @@ class GRPOTrainer(Trainer):
         if self.mask_truncated_completions:
             all_rewards = all_rewards * (all_eos_idx < max_completion_length).int()
         
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = all_rewards.view(-1, num_generations).mean(dim=1)
-        std_grouped_rewards = all_rewards.view(-1, num_generations).std(dim=1)
-        
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
-        
-        # Compute advantages
-        all_advantages = all_rewards - mean_grouped_rewards
-        if self.scale_rewards:
-            all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
+        # Do not compute advantages in eval mode
+        all_advantages = None
+        if mode == 'train':
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = all_rewards.view(-1, num_generations).mean(dim=1)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            
+            # Note: num_generations>1 is enabled in train mode
+            std_grouped_rewards = all_rewards.view(-1, num_generations).std(dim=1)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            
+            # Compute the advantages
+            all_advantages = all_rewards - mean_grouped_rewards
+            if self.scale_rewards:
+                all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
         
         # Get the primary reward (i.e., accuracy reward)
         # Note: by default, the first reward function is the accuracy reward.
@@ -1142,29 +1148,29 @@ class GRPOTrainer(Trainer):
 
             if mode == 'train':
                 print()
-                logger.debug(
-                    f"\n  [{mode}] global_step={self.state.global_step+1},"
-                    f" grpo_iteration={self.grpo_iteration+1},"
-                    f" mini_batch (grad. acc.)={self.mini_batch_step+1}"
-                    # f"\n  accuracy:            {all_accuracy_reward.cpu().tolist()}, "
-                    f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
-                    f"\n  rewards:            {all_rewards.cpu().tolist()}, "
-                    f"\n  advantages:         {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
+                logger.info(
+                    f"\n  [{mode}] global_step = {self.state.global_step+1},"
+                    f" grpo_iteration = {self.grpo_iteration+1},"
+                    f" mini_batch (grad. acc.) = {self.mini_batch_step+1}"
+                    f"\n    completion length = {all_completions_length.cpu().tolist()}"
+                    f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
+                    f"\n    total reward      = {all_rewards.cpu().tolist()}"
+                    f"\n    advantage         = {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
                 )
             else:
                 # accuracy is the primary goal!
                 print()
-                logger.debug(
-                    f"\n  [{mode}] global_step={self.state.global_step},"
-                    f"\n  completion length:  {all_completions_length.cpu().tolist()}, "
-                    f"\n  accuracy reward:    {all_accuracy_reward.cpu().tolist()}"
-                    # f"\n  rewards:            {all_rewards.cpu().tolist()}"
+                logger.info(
+                    f"\n  [{mode}] global_step = {self.state.global_step}"
+                    f"\n    completion length = {all_completions_length.cpu().tolist()}"
+                    f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
+                    # f"\n    total reward      = {all_rewards.cpu().tolist()}"
                 )
         
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
-        # TODO: keep only the local part?
+        # return all device rewards/advantages
         return (
             all_rewards_per_func,   # all rewards per function (from all devices)
             all_rewards,            # all rewards (from all devices)
@@ -1173,8 +1179,8 @@ class GRPOTrainer(Trainer):
         # Note: 
         # all_rewards_per_func: tracks the the raw reward (0.0-1.0) for each reward function.
         # all_rewards: is the weighted sum of all_rewards_per_func and may be applied mask_truncated_completions then.
+        # all_advantages: computed advantages (only enabled in train mode; is not needed in eval mode by default)
     
-
 
     def _generate_score_log_completions(
         self, 
@@ -1193,22 +1199,19 @@ class GRPOTrainer(Trainer):
         Return:
             `dict[str, Union[torch.Tensor, Any]]`.
         """
+        mode = self.mode
 
         # Generate completions: augment inputs with generated completions
         inputs = self._generate_completions(inputs)
         
         # Score completions
         all_rewards_per_func, all_rewards, all_advantages = self._score_completions(inputs)
-        # get the local slice of advantages
-        start = self.accelerator.process_index * len(inputs['prompt_ids'])
-        advantages = all_advantages[start:start+len(inputs['prompt_ids'])]      # [i:i+len(prompts)]
-        inputs['advantages'] = advantages   # to compute loss
-        inputs['rewards'] = all_rewards     # to check model generation
-        
-        # Get specific reward, for example, accuracy, based on which we can get additional metrics such as pass@k.
-        # Note: by default, the first reward function is the accuracy reward.
-        all_accuracy_reward = all_rewards_per_func[:, 0]
-        inputs['accuracy'] = all_accuracy_reward     # accuracy
+        # Get the local slice of advantages (enabled only in train mode)
+        if mode == 'train':
+            start = self.accelerator.process_index * len(inputs['prompt_ids'])
+            advantages = all_advantages[start:start+len(inputs['prompt_ids'])]      # [i:i+len(prompts)]
+            inputs['advantages'] = advantages   # for compute loss
+        inputs['rewards'] = all_rewards         # for check model generation
         
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
@@ -1690,6 +1693,7 @@ class GRPOTrainer(Trainer):
             # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
             
             del inputs, grpo_inputs
+            gc.collect()
             torch.cuda.empty_cache()
         
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
@@ -2169,7 +2173,7 @@ class GRPOTrainer(Trainer):
                         self.current_flos += float(self.floating_point_ops(inputs))
 
                         if do_sync_step:
-                            logger.debug(
+                            logger.info(
                                 f"optimizer.step: "
                                 f"grpo_iteration={self.grpo_iteration+1}"
                                 # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"

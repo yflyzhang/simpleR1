@@ -1,15 +1,15 @@
 # Train via command line
 
-# model_name_or_path=Qwen/Qwen2.5-1.5B
-model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
+model_name_or_path=Qwen/Qwen2.5-1.5B
+# model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B-Instruct
 # model_name_or_path=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 # model_name_or_path=Qwen/Qwen3-1.7B
 
 
-# train_dataset=openai/gsm8k
-train_dataset=nlile/hendrycks-MATH-benchmark
+train_dataset=openai/gsm8k
+# train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
 # train_dataset=SynthLabsAI/Big-Math-RL-Verified
 # train_dataset=hiyouga/math12k
@@ -52,6 +52,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 # export CUDA_VISIBLE_DEVICES=0,1,2
 export CUDA_VISIBLE_DEVICES=2
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 
 accelerate launch \
@@ -98,7 +99,7 @@ src/run_grpo.py \
     --eval_strategy steps \
     --eval_steps 10 \
     --eval_on_start True \
-    --log_level debug \
+    --log_level info \
     --wandb_project simpleR1-$(basename $train_dataset) \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
