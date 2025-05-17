@@ -23,7 +23,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union
+from typing import Any, Callable, Optional, Sized, Union, Iterator
 from unittest.mock import patch
 
 
@@ -98,7 +98,7 @@ RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class RepeatRandomSampler(Sampler):
     r"""
-    Sampler that repeats the indices of a dataset N times.
+    Random sampler that repeats the indices of a dataset N times.
 
     Args:
         data_source (`Sized`):
@@ -118,8 +118,10 @@ class RepeatRandomSampler(Sampler):
     Ref: RandomSampler
         https://github.com/pytorch/pytorch/blob/v2.6.0/torch/utils/data/sampler.py#L132
     """
-
-    def __init__(self, data_source: Sized, repeat_count: int, seed: Optional[int] = None):
+    data_source: Sized
+    repeat_count: int
+    
+    def __init__(self, data_source: Sized, repeat_count: int, seed: Optional[int] = None) -> None:
         self.data_source = data_source
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
@@ -127,17 +129,54 @@ class RepeatRandomSampler(Sampler):
         self.generator = torch.Generator()  # Create a local random generator
         if seed is not None:
             self.generator.manual_seed(seed)
-
-    def __iter__(self):
-        indexes = [
-            idx
-            for idx in torch.randperm(self.num_samples, generator=self.generator).tolist()
-            for _ in range(self.repeat_count)
-        ]
-        return iter(indexes)
-
-    def __len__(self):
+    
+    def __iter__(self) -> Iterator[int]:
+        for idx in torch.randperm(self.num_samples, generator=self.generator).tolist():
+            yield from [idx] * self.repeat_count
+            # for _ in range(self.repeat_count):
+            #     yield idx
+    
+    def __len__(self) -> int:
         return self.num_samples * self.repeat_count
+    
+
+# SequentialSampler for eval dataset
+class RepeatSequentialSampler(Sampler):
+    r"""Samples elements sequentially, always in the same order, with optional repetition.
+    
+    Args:
+        data_source (`Sized`):
+            Dataset to sample from.
+        repeat_count (`int`):
+            Number of times to repeat each index. Defaults to 1.
+    
+    Example:
+    ```python
+    >>> sampler = RepeatSequentialSampler(["a", "b", "c", "d"], repeat_count=2)
+    >>> list(sampler)
+    [0, 0, 1, 1, 2, 2, 3, 3]    # same order as the raw dataset
+    ```
+
+    Ref: SequentialSampler
+        https://github.com/pytorch/pytorch/blob/v2.6.0/torch/utils/data/sampler.py#L113
+    """
+    data_source: Sized
+    repeat_count: int
+
+    def __init__(self, data_source: Sized, repeat_count: int=1) -> None:
+        self.data_source = data_source
+        self.repeat_count = repeat_count
+    
+    def __iter__(self) -> Iterator[int]:
+        # return iter(range(len(self.data_source)))
+        for idx in range(len(self.data_source)):
+            yield from [idx] * self.repeat_count
+            # for _ in range(self.repeat_count):
+            #     yield idx
+    
+    def __len__(self) -> int:
+        return len(self.data_source) * self.repeat_count
+
 
 
 class GRPOTrainer(Trainer):
@@ -626,10 +665,12 @@ class GRPOTrainer(Trainer):
         return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
     
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
-        # Returns a sampler that ensures each prompt is repeated across multiple processes.
-        # See `_get_train_sampler for an explanation of the sampler.
-        return RepeatRandomSampler(eval_dataset, self.num_eval_generations, seed=self.args.seed)
-      
+        # Note: In eval mode, no need to shuffle the dataset sample order!
+        # Returns a sequential sampler that ensures each prompt is repeated across multiple processes.
+        # See `RepeatSequentialSampler` and `_get_train_sampler for an explanation of the sampler.
+        return RepeatSequentialSampler(eval_dataset, self.num_eval_generations)
+        
+        
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
@@ -1243,24 +1284,32 @@ class GRPOTrainer(Trainer):
         else:       # eval mode
             num_generations = self.num_eval_generations
             max_completion_length = self.max_eval_completion_length
-
+        
         eos_idx = inputs['eos_idx']
         prompts = inputs['prompts']
         completions = inputs['completions']
         
-        # Prompt text (may apply chat template, e.g. with system prompt)
-        prompts_text = [
-            maybe_apply_chat_template({'prompt': p}, self.processing_class)['prompt'] for p in prompts
-        ]
-        # Completion text (may extract from conversational message)
+        # 1. Problem text
+        if is_messages(prompts[0]):
+            # by default, the last one denotes the problem: prompts = [{}, {'role': 'user', 'content': problem_text}]
+            problems_text = [example[-1]['content'] for example in prompts]
+        else:
+            # may apply chat template, e.g. with system prompt
+            problems_text = [
+                maybe_apply_chat_template({'prompt': p}, self.processing_class)['prompt'] for p in prompts
+            ]
+        
+        # 2. Raw solution text (gold) (may change it to `answer`?)
+        solutions_text = inputs['solutions']
+        
+        # 3. Completion text (may extract from conversational message)
         if is_messages(completions[0]):
             completions_text = [example[0]['content'] for example in completions]
             # completions_text = [example['content'] for example in completions]
         else:
             completions_text = completions
         
-        # Raw solution text (gold) (may change it to `answer`?)
-        solutions_text = inputs['solutions']
+
         
         if (
             self.accelerator.is_main_process and
@@ -1278,7 +1327,7 @@ class GRPOTrainer(Trainer):
             #   unique-sample-level mean: [[1,1, 1,1], [0,0]] -> [1, 1, 0] -> 2/3 = 0.67
             # This example explains why we use `view(-1, num_generations)` below.
             
-            # 1. Log completion length (including truncated completions): mean, min, max
+            # 4. Completion length (including truncated completions): mean, min, max
             all_eos_idx = gather(eos_idx)
             all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
             # (a) naive mean/min/max
@@ -1291,37 +1340,13 @@ class GRPOTrainer(Trainer):
             self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
             self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
             
-            # Ratio of truncated sequences (completions without EOS token).
+            # 5. Ratio of truncated sequences (completions without EOS token).
             # Note: `eos_idx` is equal to `max_completion_length` for completions with EOS token.
             reshaped = (all_eos_idx == max_completion_length).float().view(-1, num_generations)
             self._metrics[mode]["completions/truncated_ratio"].extend(reshaped.mean(-1).tolist())
             
             
-            # 2. Log rewards
-            # (a) log combined reward (e.g., accuracy reward + format reward)
-            reshaped = all_rewards.view(-1, num_generations)
-            self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
-            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                # reward std: enabled when num_generations > 1
-                self._metrics[mode]["reward_std"].extend(reshaped.std(-1).tolist())
-            
-            # (b) log each specific reward (e.g., 1. accuracy reward; 2. format reward)
-            mean_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
-            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                # reward std: enabled when num_generations > 1
-                std_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).std(1)
-            for i, reward_func in enumerate(self.reward_funcs):
-                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-                else:
-                    reward_func_name = reward_func.__name__
-                # mean of each reward
-                self._metrics[mode][f"rewards/{reward_func_name}"].extend(mean_rewards_per_func[:, i].tolist())
-                # std of each reward
-                if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                    self._metrics[mode][f"rewards/{reward_func_name}_std"].extend(std_rewards_per_func[:, i].tolist())
-            
-            # 3. Log concrete completion examples
+            # 6. Completion examples (table)
             global_step = self.state.global_step
             if mode == 'train':
                 global_step += 1    # +1 trick for train
@@ -1329,12 +1354,50 @@ class GRPOTrainer(Trainer):
             completion_table = {
                 "global_step": [global_step] * len(all_completions_length),
                 "mini_batch": [self.mini_batch_step+1] * len(all_completions_length),
-                "prompt": gather_object(prompts_text),
+                "problem": gather_object(problems_text),
                 "solution": gather_object(solutions_text),
                 "completion": gather_object(completions_text),
                 "completion_length": all_completions_length.tolist(),
-                "reward": all_rewards.tolist(),
+                # "reward": all_rewards.tolist(),
             }
+            
+            # 7. Rewards
+            # (7.1) log combined reward (e.g., accuracy reward + format reward)
+            reshaped = all_rewards.view(-1, num_generations)    # [batch_size, num_generations]
+            self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
+            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                # reward std: enabled when num_generations > 1
+                self._metrics[mode]["reward_std"].extend(reshaped.std(-1).tolist())
+            
+            # (7.2) log each specific reward (e.g., accuracy reward and format reward)
+            mean_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
+            # Note: batch_size = num_unique_problems * num_generations
+            # reshape: [batch_size, num_reward_funcs] -> [num_unique_problems, num_generations, num_reward_funcs]
+            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                # reward std: enabled when num_generations > 1
+                std_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).std(1)
+            
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                
+                # all of each reward: [batch_size, num_reward_funcs]
+                completion_table[reward_func_name] = all_rewards_per_func[:, i].tolist()
+                
+                # mean of each reward: [num_unique_problems, num_reward_funcs]
+                self._metrics[mode][f"rewards/{reward_func_name}"].extend(mean_rewards_per_func[:, i].tolist())
+                # std of each reward: [num_unique_problems, num_reward_funcs]
+                if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                    self._metrics[mode][f"rewards/{reward_func_name}_std"].extend(std_rewards_per_func[:, i].tolist())
+            
+            # 6.continue Completion examples
+            completion_table["reward"] = all_rewards.tolist()
+            if mode == 'eval':  # no 'mini_batch' in eval mode
+                del completion_table['mini_batch']
+            
+            # Append current examples to the global buffer: `_completion_examples`
             self._completion_examples[mode].append(completion_table)
     
     
@@ -1730,6 +1793,7 @@ class GRPOTrainer(Trainer):
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
+        # Log `_metrics` and `_completion_examples` in wandb
         # self.log(metrics)
         self.log({})
         
@@ -2082,7 +2146,7 @@ class GRPOTrainer(Trainer):
             epoch_iterator = iter(epoch_dataloader)
             # We chunkify the epoch iterator into gradient accumulation steps `n` batches
             # remainder = num_examples % args.gradient_accumulation_steps
-            # TODO: the above estimation is not accurate in current setting, change it to the below:
+            # Note: the above estimation is not accurate in current setting, change it to the following:
             remainder = len_dataloader % args.gradient_accumulation_steps
             num_mini_batches = args.gradient_accumulation_steps
             for update_step in range(num_update_steps_per_epoch):
