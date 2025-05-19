@@ -1,13 +1,13 @@
-<h1 align="center"> simpleR1: A simple implementation of training R1-like llms using GRPO</h1>
+<h1 align="center"> simpleR1: A simple framework for training R1-like models</h1>
 
 
-**simpleR1** is a simple implementation of DeepSeek R1, a large language model that excels at reasoning tasks like math and code. This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](https://github.com/huggingface/open-r1) project, with a focus on ease of use and enhanced training features. 
-
-The latest version includes an upgraded GRPO Trainer with a custom evaluate function for simultaneous training and evaluation, modularized model completion and reward score estimation.
-
+**simpleR1** is a simple framework for training R1-like models, aiming to improve llm's reasoning abilities in math and code. 
+This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](https://github.com/huggingface/open-r1) project, with a focus on ease of use and enhanced training features. 
 
 
 ## Key Features
+
+The latest version includes an upgraded GRPO Trainer with a custom evaluate function for simultaneous training and evaluation, modularized model completion and reward score estimation.
 
 - Enhanced GRPO trainer with multi-iteration support, precise time estimation (tqdm), custom evaluate block, and wandb logging.
 
