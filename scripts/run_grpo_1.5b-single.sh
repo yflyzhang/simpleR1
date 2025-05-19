@@ -8,7 +8,7 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 
 
 train_dataset=openai/gsm8k
-# train_dataset=nlile/hendrycks-MATH-benchmark
+train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
 # train_dataset=SynthLabsAI/Big-Math-RL-Verified
 # train_dataset=hiyouga/math12k
