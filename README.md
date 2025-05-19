@@ -73,10 +73,8 @@ Below is the plot comparing evaluation accuracy across the four models:
 </p>
 
 
-#### Logs
-
-📈 More train and eval logs are available at Wandb Project: 
-    <a href="https://api.wandb.ai/links/yflyzhang/wkdme9ea">wandb log</a>
+**📈Logs:** More train and eval logs are available at Wandb project: 
+    <a href="https://api.wandb.ai/links/yflyzhang/wkdme9ea">wandb log</a>.
 
 
 
