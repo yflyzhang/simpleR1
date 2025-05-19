@@ -133,6 +133,71 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
     return dataset
 
 
+######################
+# Check gpu idle
+######################
+import subprocess
+import pandas as pd
+from io import StringIO
+import re
+
+def get_visible_gpus():
+    """
+    Get the list of visible GPU IDs from CUDA_VISIBLE_DEVICES.
+    Returns a list of GPU indices or None if not set or empty.
+    """
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if cuda_visible is None or cuda_visible.strip() == "":
+        # If CUDA_VISIBLE_DEVICES is not set or empty, return None to check all GPUs
+        return None
+    try:
+        # Parse comma-separated GPU IDs
+        gpu_ids = [int(gpu_id.strip()) for gpu_id in cuda_visible.split(',')]
+        return gpu_ids if gpu_ids else None
+    except ValueError:
+        print("Invalid CUDA_VISIBLE_DEVICES format, treating as no restriction.")
+        return None
+
+
+def check_gpu_free(gpu_memory_threshold=10000, gpu_util_threshold=10):
+    """
+    Check if the GPU is idle.
+    gpu_memory_threshold: GPU memory usage threshold (MB), below which the GPU is considered idle.
+    gpu_util_threshold: GPU utilization threshold (%), below which the GPU is considered idle.
+    Returns True if the GPU is idle, False if it is busy.
+    """
+    try:
+        # Run nvidia-smi command to get GPU information. Note: nvidia-smi will get all GPU information.
+        gpu_stat = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.used,utilization.gpu', '--format=csv'],
+            stdout=subprocess.PIPE, text=True, check=True
+        )
+        # Parse CSV output
+        df = pd.read_csv(
+            StringIO(gpu_stat.stdout),
+            names=['memory.used [MiB]', 'utilization.gpu [%]'],
+            skiprows=1
+        )
+        # Get visible gpus if any
+        visible_gpus = get_visible_gpus()
+        if visible_gpus is not None:
+            df = df[df.index.astype(int).isin(visible_gpus)]
+        print(df)
+        # Check memory usage and utilization for each GPU
+        for i, row in df.iterrows():
+            # Extract memory usage (MB)
+            memory_used = int(re.search(r'\d+', row['memory.used [MiB]']).group())
+            # Extract utilization (%)
+            utilization = int(re.search(r'\d+', row['utilization.gpu [%]']).group())
+            # If any GPU's memory usage or utilization exceeds the threshold, consider it busy
+            if memory_used > gpu_memory_threshold or utilization > gpu_util_threshold:
+                return False
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error running nvidia-smi: {e}")
+        return False
+
+
 ####################
 # Profiling context
 ####################

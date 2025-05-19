@@ -58,7 +58,21 @@ def main():
     # Arguments
     parser = TrlParser((GRPOScriptArguments, GRPOTrainingArguments, ModelArguments))
     script_args, training_args, model_args = parser.parse_args_and_config()
-
+    
+    #################
+    # Check GPU idle
+    #################
+    if script_args.check_gpu_idle:
+        import time
+        from utils import check_gpu_free
+        print("\n\n***** Check gpu idle *****")
+        wait_time = 60*5    # seconds
+        while not check_gpu_free(gpu_memory_threshold=10000, gpu_util_threshold=10):
+            print(f"\nGPU is busy, waiting for {wait_time} seconds...")
+            time.sleep(wait_time)  # Check every wait_time seconds
+        print("GPU is free, proceeding with next step.")
+    
+    
     # Set seed for reproducibility
     set_seed(training_args.seed)
 

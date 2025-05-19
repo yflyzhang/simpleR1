@@ -96,7 +96,7 @@ src/run_grpo.py \
     --eval_strategy steps \
     --eval_steps 10 \
     --eval_on_start True \
-    --log_level debug \
+    --log_level info \
     --wandb_project simpleR1-$(basename $train_dataset) \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE

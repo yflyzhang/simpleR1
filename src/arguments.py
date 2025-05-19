@@ -28,13 +28,13 @@ class ScriptArguments:
             Debug argument for distributed training. Fix for DDP issues with LM bias/mask buffers - invalid scalar
             type, inplace operation. See https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992.
     """
-
+    
     # dataset_name: str = field(
     #     default=None,
     #     metadata={"help": "Dataset name."}
     # )
     
-    train_dataset_name: Optional[str] = field(
+    train_dataset_name: str = field(
         default=None,
         metadata={"help": "Train dataset name."},
     )
@@ -42,7 +42,7 @@ class ScriptArguments:
         default=None,
         metadata={"help": "Test dataset name."},
     )
-
+    
     dataset_config: Optional[str] = field(
         default=None,
         metadata={
@@ -75,6 +75,27 @@ class ScriptArguments:
         metadata={"help": "Max number of samples used for test."},
     )
 
+    check_gpu_idle: bool = field(
+        default=False,
+        metadata={
+            "help": "If set, wait for GPU to be idle before running. If not set, run scripts without checking GPU."
+        },
+    )
+
+    gpu_memory_threshold: int = field(
+        default=1000,
+        metadata={
+            "help": "GPU memory usage threshold in MB to consider GPU idle."
+        },
+    )
+    
+    gpu_util_threshold: int = field(
+        default=10,
+        metadata={
+            "help": "GPU utilization threshold in percentage to consider GPU idle."
+        },
+    )
+    
     def to_json_string(self):
         """
         Serializes this instance to a JSON string.
