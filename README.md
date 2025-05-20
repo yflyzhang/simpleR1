@@ -53,44 +53,76 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ## 📚 Examples
 
 
-### Training Qwen2.5 Models on MATH benchmark
+### Training on MATH dataset
 
-We trained four `Qwen2.5-1.5B` models on the MATH dataset, with real-time evaluation on MATH-500 using the `evaluate` function.
+We trained four `Qwen2.5-1.5B*` models and one `Qwen3-0.6B*` model on the `MATH` dataset, with real-time evaluation on MATH-500 using the `evaluate` function.
 
 - **Models**: 
-`Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-Math-1.5B`, `Qwen/Qwen2.5-Math-1.5B-Instruct`.
-- **Setup**: Trained for 1 epoch, 3 grpo iterations, with parameters as shown in the usage example.
-Evaluation accuracy and completion length were logged via wandb.
-- **Results**: All models improved accuracy, with Math-specific models (`Qwen2.5-Math-1.5B*`) outperforming general models (`Qwen2.5-1.5B*`). Completion length varied, with Instruct models often producing shorter outputs.
+`Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-Math-1.5B`, `Qwen/Qwen2.5-Math-1.5B-Instruct`, `Qwen/Qwen3-0.6B`.
+
+- **Setup**: Trained for 1 epoch, 3 grpo iterations, with parameters as shown in the usage example. Train and evaluation accuracy and completion length were logged via wandb.
+
+- **Rewards**: Rule-based rewards were adopted in the example, including 'accuracy reward', 'format reward', and 'tag count reward', with different weights to arrive at the final reward signal. For example, `reward = 8 * accuracy_reward + 1 * format_reward + 1 * tag_count_reward`.
+
+- **Results**: 
+  - All models improved accuracy, with Math-specific models (`Qwen2.5-Math-1.5B*`) outperforming general models (`Qwen2.5-1.5B*`). 
+  - Completion length varied, with Instruct models often producing shorter outputs. 
+  - `Qwen3-0.6B` outperforms all the tested `Qwen2.5*-1.5B*` variants except for `Qwen2.5-Math-1.5B-Instruct`, but this superior performance comes at the expense of generating significantly more tokens. 
 
 ### Model Accuracy Comparison
 
 Below is the plot comparing evaluation accuracy across the four models:
 
-<p align="left">
-  <img src="imgs/wandb_log.png" width="900" />
-    <strong>Fig 1. SimpleR1 running example (eval on MATH-500).</strong>
+<p align="center">
+  <img src="imgs/wandb_log-math.png" width="800" />
+  <br>
+  <strong>Fig 1. SimpleR1 running example (eval on MATH-500).</strong>
+  <br>
+  📈 More train and eval logs are available at WandB project: 
+      <a href="https://api.wandb.ai/links/yflyzhang/wkdme9ea">wandb log</a>.
 </p>
-
-
-**📈Logs:** More train and eval logs are available at Wandb project: 
-    <a href="https://api.wandb.ai/links/yflyzhang/wkdme9ea">wandb log</a>.
-
 
 
 ### Results Table
 
-| Model | Initial Accuracy | Best Accuracy | Completion Length Trend | Token Efficiency |
+<!-- | Model | Initial Accuracy | Best Accuracy | Completion Length Trend | Token Efficiency |
 | --- | --- | --- | --- | --- |
 | `Qwen2.5-1.5B` | 0.150 | 0.478 | 2,044 → 550 tokens | ↑ |
 | `Qwen2.5-1.5B-Instruct` | 0.368 | 0.492 | 455 → 552 tokens |  ↓ |
 | `Qwen2.5-Math-1.5B` | 0.432 | 0.606 | 1425 → 812 tokens | ↑ |
-| `Qwen2.5-Math-1.5B-Instruct` | 0.738 | 0.766 | 591 → 581 tokens | -- |
+| `Qwen2.5-Math-1.5B-Instruct` | 0.738 | 0.766 | 591 → 581 tokens | -- | -->
+
+
+| Model | Initial Accuracy | Best Accuracy | Completion Length Trend | Token Efficiency | Runtime |
+| --- | --- | --- | --- | --- | --- |
+| `Qwen2.5-1.5B` | 0.150 | 0.478 | 2,044 → 550 tokens | ↑ | 3h 37m 55 |
+| `Qwen2.5-1.5B-Instruct` | 0.368 | 0.492 | 455 → 552 tokens |  ↓ | 2h 18m 43 |
+| `Qwen2.5-Math-1.5B` | 0.432 | 0.606 |  1425 → 812 tokens | ↑ | 3h 6m 20s |
+| `Qwen2.5-Math-1.5B-Instruct` | 0.738 | 0.766 | 591 → 581 tokens | -- | 5h 39m 41 |
+| `Qwen3-0.6B` | 0.576 | 0.612 | 2096 → 1799 tokens | ↑ | 11h 3m 10 |
+
+
+
+### Training on `gsm8k` while eval on `MATH-500`
+
+We also trained the models on `gsm8k` (with 1000 samples for fast test) and evaluated on `MATH-500`.
+The detailed train and eval logs are available at this WandB project: 
+<a href="https://wandb.ai/yflyzhang/simpleR1-gsm8k/reports/SimpleR1-Training-Examples-gsm8k---VmlldzoxMjg1MjE4Mw?accessToken=ifm2s40kzp8a5i5n94jozsli50mdp978s9hz8ukjrqezo0frsj684l2aayvn5r7d">wandb log</a>.
+
+<details>
+  <summary>Click to expand/collapse the snapshot of eval results</summary>
+  <p align="center">
+    <img src="imgs/wandb_log-gsm.png" width="800" />
+    <br>
+    <strong>Fig 2. Train on gsm8k while evaluate on MATH-500.</strong>
+  </p>
+</details>
+
 
 ### Case Examples
 
 
-Below are an example response from trained **`Qwen2.5-1.5B`** for the MATH-500 problem:
+Below is an example response from trained **`Qwen2.5-1.5B`** for the MATH-500 problem:
 <details>
   <summary>Click to expand/collapse</summary>
 
