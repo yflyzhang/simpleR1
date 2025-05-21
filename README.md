@@ -34,7 +34,8 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 │       └── ...     
 │           
 ├── scripts/                   # Bash scripts to run
-│   ├── run_grpo_1.5b.sh       # Shell for running a 1.5b model
+│   ├── run_grpo_qwen2.5-1.5b-single.sh   # Shell for running Qwen2.5-1.5B with a single gpu
+│   ├── run_grpo_qwen3-0.6b-single.sh     # Shell for running Qwen3-0.6B with a single gpu
 │   └── ...         
 │           
 ├── src/                       # Python codes
@@ -53,14 +54,14 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ## 📚 Examples
 
 
-### Training on MATH dataset
+### Training on MATH-benchmark and evaluating on MATH-500
 
-We trained four `Qwen2.5-1.5B*` models and one `Qwen3-0.6B*` model on the `MATH` dataset, with real-time evaluation on MATH-500 using the `evaluate` function.
+We trained four `Qwen2.5-1.5B*` models and one `Qwen3-0.6B*` model on [MATH-benchmark](https://huggingface.co/datasets/nlile/hendrycks-MATH-benchmark), with real-time evaluation on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500) using the `evaluate` function.
 
 - **Models**: 
 `Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-Math-1.5B`, `Qwen/Qwen2.5-Math-1.5B-Instruct`, `Qwen/Qwen3-0.6B`.
 
-- **Setup**: Trained for 1 epoch, 3 grpo iterations, with parameters as shown in the usage example. Train and evaluation accuracy and completion length were logged via wandb.
+- **Setup**: Trained for 1 epoch, 3 grpo iterations, with one NVIDIA A100-80G GPU and parameters as shown in the usage example. Train and evaluation accuracy and completion length were logged via wandb.
 
 - **Rewards**: Rule-based rewards were adopted in the example, including 'accuracy reward', 'format reward', and 'tag count reward', with different weights to arrive at the final reward signal. For example, `reward = 8 * accuracy_reward + 1 * format_reward + 1 * tag_count_reward`.
 
@@ -103,26 +104,25 @@ Below is the plot comparing evaluation accuracy across the four models:
 
 
 
-### Training on `gsm8k` while eval on `MATH-500`
+### Training on `gsm8k` and evaluating on `MATH-500`
 
-We also trained the models on `gsm8k` (with 1000 samples for fast test) and evaluated on `MATH-500`.
-The detailed train and eval logs are available at this WandB project: 
-<a href="https://wandb.ai/yflyzhang/simpleR1-gsm8k/reports/SimpleR1-Training-Examples-gsm8k---VmlldzoxMjg1MjE4Mw?accessToken=ifm2s40kzp8a5i5n94jozsli50mdp978s9hz8ukjrqezo0frsj684l2aayvn5r7d">wandb log</a>.
+We also trained the models on [gsm8k](https://huggingface.co/datasets/openai/gsm8k) (with 1000 samples for fast test) and evaluated on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500). The evaluation results can be found as follows:
 
-<details>
-  <summary>Click to expand/collapse the snapshot of eval results</summary>
-  <p align="center">
-    <img src="imgs/wandb_log-gsm.png" width="800" />
-    <br>
-    <strong>Fig 2. Train on gsm8k while evaluate on MATH-500.</strong>
-  </p>
-</details>
+<p align="center">
+<img src="imgs/wandb_log-gsm.png" width="800" />
+<br>
+<strong>Fig 2. Train on gsm8k and evaluate on MATH-500.</strong>
+<br>
+📈 More train and eval logs are available at WandB project: 
+<a href="https://wandb.ai/yflyzhang/simpleR1-gsm8k/reports/SimpleR1-Training-Examples-gsm8k---VmlldzoxMjg1MjE4Mw?accessToken=ifm2s40kzp8a5i5n94jozsli50mdp978s9hz8ukjrqezo0frsj684l2aayvn5r7d">wandb log</a>
+</p>
+
 
 
 ### Case Examples
 
 
-Below is an example response from trained **`Qwen2.5-1.5B`** for the MATH-500 problem:
+Below is an response example from trained `Qwen2.5-1.5B` on a MATH-500 problem:
 <details>
   <summary>Click to expand/collapse</summary>
 
@@ -180,11 +180,11 @@ cd simpleR1
 2. Example training command:
 
 ```bash
-bash scripts/run_grpo_1.5b-single.sh
+bash scripts/run_grpo_qwen2.5-1.5b-single.sh
 ```
 
 > [!NOTE]
-> `run_grpo_1.5b-single.sh` provides a concrete runing example using only one A100-80G GPU, please change the parameters therein accordingly.
+> `run_grpo_qwen2.5-1.5b-single.sh` provides a concrete runing example using only one A100-80G GPU, please change the parameters therein accordingly.
 
 Or override additional parameters via command line. For example,
 
@@ -258,13 +258,9 @@ conda activate /path/simpler1
 conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
 
 pip install transformers==4.51.0 accelerate==1.4.0 trl==0.16.0 deepspeed==0.16.4
-
 pip install flash-attn --no-build-isolation
-
 pip install vllm==0.7.2
-
 pip install math-verify==0.5.2 latex2sympy2_extended==1.0.6
-
 pip install wandb==0.19.7
 ```
 
