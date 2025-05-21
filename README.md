@@ -61,7 +61,7 @@ We trained four `Qwen2.5-1.5B*` models and one `Qwen3-0.6B*` model on [MATH-benc
 - **Models**: 
 `Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-Math-1.5B`, `Qwen/Qwen2.5-Math-1.5B-Instruct`, `Qwen/Qwen3-0.6B`.
 
-- **Setup**: Trained for 1 epoch, 3 grpo iterations, with one NVIDIA A100-80G GPU and parameters as shown in the usage example. Train and evaluation accuracy and completion length were logged via wandb.
+- **Setup**: Trained for 1 epoch, 3 grpo iterations, with one NVIDIA A100-80G GPU and parameters as shown in the usage example. The max completion length is set as 2,048 and 4,096 for train and eval mode, respectively. Train and evaluation accuracy and completion length were logged via wandb.
 
 - **Rewards**: Rule-based rewards were adopted in the example, including 'accuracy reward', 'format reward', and 'tag count reward', with different weights to arrive at the final reward signal. For example, `reward = 8 * accuracy_reward + 1 * format_reward + 1 * tag_count_reward`.
 
@@ -242,9 +242,8 @@ src/run_grpo.py \
 ```
 
 
-## Requirements
-See `requirements.txt` for a full list, but generally you don't need to install all of them. 
-
+## Dependencies
+See `requirements.txt` for a full list, but generally you don't need to install all of them. <br>
 Key dependencies include and can be installed as follows:
 
 ```bash
