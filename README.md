@@ -62,6 +62,7 @@ We trained four `Qwen2.5-1.5B*` models and one `Qwen3-0.6B*` model on [MATH-benc
 `Qwen/Qwen2.5-1.5B`, `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-Math-1.5B`, `Qwen/Qwen2.5-Math-1.5B-Instruct`, `Qwen/Qwen3-0.6B`.
 
 - **Setup**: Trained for 1 epoch, 3 grpo iterations, with one NVIDIA A100-80G GPU and parameters as shown in the usage example. The max completion length is set as 2,048 and 4,096 for train and eval mode, respectively. Train and evaluation accuracy and completion length were logged via wandb.
+  > Note: The example parameter setting is for demonstration purposes only, not optimal. For example, increasing the learning rate to 5e-6 or disabling the kl penalty can further improve the performance.
 
 - **Rewards**: Rule-based rewards were adopted in the example, including 'accuracy reward', 'format reward', and 'tag count reward', with different weights to arrive at the final reward signal. For example, `reward = 8 * accuracy_reward + 1 * format_reward + 1 * tag_count_reward`.
 
@@ -104,7 +105,7 @@ Below is the plot comparing evaluation accuracy across the four models:
 
 
 
-### Training on `gsm8k` and evaluating on `MATH-500`
+### Training on gsm8k and evaluating on MATH-500
 
 We also trained the models on [gsm8k](https://huggingface.co/datasets/openai/gsm8k) (with 1000 samples for fast test) and evaluated on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500). The evaluation results can be found as follows:
 
