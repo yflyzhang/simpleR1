@@ -26,7 +26,7 @@ import transformers
 # from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 from transformers.trainer_utils import get_last_checkpoint
-
+from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
 from accelerate.utils import is_peft_model, set_seed
 from trl.models import create_reference_model
@@ -207,6 +207,10 @@ def main():
         # If PEFT is used, the reference model is not needed since the adapter can be disabled
         # to revert to the initial model.
         ref_model = None
+    elif is_deepspeed_zero3_enabled():
+        # If DeepSpeed ZeRO-3 is enabled, it's not compatible with `create_reference_model()`. 
+        # Please instantiate the reference model directly with `AutoModelForCausalLM.from_pretrained()`
+        ref_model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_init_kwargs)
     else:
         # Create a reference model based on the initial model.
         ref_model = create_reference_model(model)
