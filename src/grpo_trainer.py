@@ -444,7 +444,14 @@ class GRPOTrainer(Trainer):
             callbacks=callbacks,
             optimizers=optimizers,
         )
-
+        
+        # Note: the log level (of logger) is set depending on the node. 
+        # By default, the main process (rank 0) logs at level INFO, while other processes log at level WARNING.
+        # For further details, see:
+        # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L470.
+        # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/training_args.py#L2404
+        
+        
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
         num_processes = self.accelerator.num_processes
         effective_batch_size = args.per_device_train_batch_size * num_processes
@@ -912,16 +919,13 @@ class GRPOTrainer(Trainer):
 
                     # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
-                        logger.info(f"\n  [attempt={attempt}]: Current model generation is good.")
+                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is good.")
                         break
                     elif attempt == max_attempts:
-                        logger.warning(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
+                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
                     else:
-                        logger.warning(f"\n  [attempt={attempt}]: Current model generation is not good, try again...")
-                    
-                    # # >>>>> add a breakpoint for debug? <<<<<
-                    # torch.distributed.breakpoint(rank=0)                    
-                
+                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is not good, try again...")
+                 
                 # Get per token logps (old_per_token_logps and ref_per_token_logps)
                 # Note: call `_get_batch_logps` after the last attempt.
                 # Concatenate prompt with completion for logit computation: (B, P+C)
@@ -1070,7 +1074,6 @@ class GRPOTrainer(Trainer):
 
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
-
         return {
             # 1. text
             "problems": problems,
@@ -1184,30 +1187,30 @@ class GRPOTrainer(Trainer):
         all_accuracy_reward = all_rewards_per_func[:, 0]
         
         # Print reward info in the main process
-        if self.accelerator.is_main_process:
-            all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
-
-            if mode == 'train':
-                print()
-                logger.info(
-                    f"\n  [{mode}] global_step = {self.state.global_step+1},"
-                    f" grpo_iteration = {self.grpo_iteration+1},"
-                    f" mini_batch (grad. acc.) = {self.mini_batch_step+1}"
-                    f"\n    completion length = {all_completions_length.cpu().tolist()}"
-                    f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
-                    f"\n    total reward      = {all_rewards.cpu().tolist()}"
-                    f"\n    advantage         = {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
-                )
-            else:
-                # accuracy is the primary goal!
-                print()
-                logger.info(
-                    f"\n  [{mode}] global_step = {self.state.global_step}"
-                    f"\n    completion length = {all_completions_length.cpu().tolist()}"
-                    f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
-                    # f"\n    total reward      = {all_rewards.cpu().tolist()}"
-                )
+        # if self.accelerator.is_main_process:
+        all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
+        print()     # for better readability only
         
+        # Note: By default, log level in the main process is set to INFO, while the rest processes are set to WARNING.
+        if mode == 'train':
+            logger.info(
+                f"\n  [{mode}] global_step = {self.state.global_step+1},"
+                f" grpo_iteration = {self.grpo_iteration+1},"
+                f" mini_batch (grad. acc.) = {self.mini_batch_step+1}"
+                f"\n    completion length = {all_completions_length.cpu().tolist()}"
+                f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
+                f"\n    total reward      = {all_rewards.cpu().tolist()}"
+                f"\n    advantage         = {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
+            )
+        else:
+            # accuracy is the primary goal!
+            logger.info(
+                f"\n  [{mode}] global_step = {self.state.global_step}"
+                f"\n    completion length = {all_completions_length.cpu().tolist()}"
+                f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
+                # f"\n    total reward      = {all_rewards.cpu().tolist()}"
+            )
+    
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
         
@@ -1254,12 +1257,13 @@ class GRPOTrainer(Trainer):
             inputs['advantages'] = advantages   # for compute loss
         inputs['rewards'] = all_rewards         # for check model generation
         
-        # # >>>>> add a breakpoint for debug? <<<<<
-        # torch.distributed.breakpoint(rank=0)
         
         # log the first attempt (may change it accordingly)
         if attempt == 1:
             self._log_completions(inputs, all_rewards_per_func, all_rewards)
+        
+        # Synchronize: wait for all processes to finish before continuing
+        self.accelerator.wait_for_everyone()
         
         return inputs 
         
@@ -1309,10 +1313,7 @@ class GRPOTrainer(Trainer):
         else:
             completions_text = completions
         
-
-        
         if (
-            self.accelerator.is_main_process and
             self.log_completions and 
             self.state.global_step % self.args.logging_steps == 0 and
             self.args.report_to and "wandb" in self.args.report_to
@@ -1330,20 +1331,22 @@ class GRPOTrainer(Trainer):
             # 4. Completion length (including truncated completions): mean, min, max
             all_eos_idx = gather(eos_idx)
             all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
-            # (a) naive mean/min/max
-            # self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
-            # self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
-            # self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
-            # (b) unique-sample-level mean/min/max
-            reshaped = all_completions_length.float().view(-1, num_generations)
-            self._metrics[mode]["completions/mean_length"].extend(reshaped.mean(-1).tolist())
-            self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
-            self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
-            
-            # 5. Ratio of truncated sequences (completions without EOS token).
-            # Note: `eos_idx` is equal to `max_completion_length` for completions with EOS token.
-            reshaped = (all_eos_idx == max_completion_length).float().view(-1, num_generations)
-            self._metrics[mode]["completions/truncated_ratio"].extend(reshaped.mean(-1).tolist())
+
+            if self.accelerator.is_main_process:
+                # (a) naive mean/min/max
+                # self._metrics[mode]["completions/mean_length"].append(all_completions_length.float().mean().item())
+                # self._metrics[mode]["completions/min_length"].append(all_completions_length.float().min().item())
+                # self._metrics[mode]["completions/max_length"].append(all_completions_length.float().max().item())
+                # (b) unique-sample-level mean/min/max
+                reshaped = all_completions_length.float().view(-1, num_generations)
+                self._metrics[mode]["completions/mean_length"].extend(reshaped.mean(-1).tolist())
+                self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
+                self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
+                
+                # 5. Ratio of truncated sequences (completions without EOS token).
+                # Note: `eos_idx` is equal to `max_completion_length` for completions with EOS token.
+                reshaped = (all_eos_idx == max_completion_length).float().view(-1, num_generations)
+                self._metrics[mode]["completions/truncated_ratio"].extend(reshaped.mean(-1).tolist())
             
             
             # 6. Completion examples (table)
@@ -1361,44 +1364,45 @@ class GRPOTrainer(Trainer):
                 # "reward": all_rewards.tolist(),
             }
             
-            # 7. Rewards
-            # (7.1) log combined reward (e.g., accuracy reward + format reward)
-            reshaped = all_rewards.view(-1, num_generations)    # [batch_size, num_generations]
-            self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
-            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                # reward std: enabled when num_generations > 1
-                self._metrics[mode]["reward_std"].extend(reshaped.std(-1).tolist())
-            
-            # (7.2) log each specific reward (e.g., accuracy reward and format reward)
-            mean_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
-            # Note: batch_size = num_unique_problems * num_generations
-            # reshape: [batch_size, num_reward_funcs] -> [num_unique_problems, num_generations, num_reward_funcs]
-            if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                # reward std: enabled when num_generations > 1
-                std_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).std(1)
-            
-            for i, reward_func in enumerate(self.reward_funcs):
-                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-                else:
-                    reward_func_name = reward_func.__name__
-                
-                # all of each reward: [batch_size, num_reward_funcs]
-                completion_table[reward_func_name] = all_rewards_per_func[:, i].tolist()
-                
-                # mean of each reward: [num_unique_problems, num_reward_funcs]
-                self._metrics[mode][f"rewards/{reward_func_name}"].extend(mean_rewards_per_func[:, i].tolist())
-                # std of each reward: [num_unique_problems, num_reward_funcs]
+            if self.accelerator.is_main_process:
+                # 7. Rewards
+                # (7.1) log combined reward (e.g., accuracy reward + format reward)
+                reshaped = all_rewards.view(-1, num_generations)    # [batch_size, num_generations]
+                self._metrics[mode]["reward"].extend(reshaped.mean(-1).tolist())
                 if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
-                    self._metrics[mode][f"rewards/{reward_func_name}_std"].extend(std_rewards_per_func[:, i].tolist())
-            
-            # 6.continue Completion examples
-            completion_table["reward"] = all_rewards.tolist()
-            if mode == 'eval':  # no 'mini_batch' in eval mode
-                del completion_table['mini_batch']
-            
-            # Append current examples to the global buffer: `_completion_examples`
-            self._completion_examples[mode].append(completion_table)
+                    # reward std: enabled when num_generations > 1
+                    self._metrics[mode]["reward_std"].extend(reshaped.std(-1).tolist())
+                
+                # (7.2) log each specific reward (e.g., accuracy reward and format reward)
+                mean_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).mean(1)  # average over num_generations
+                # Note: batch_size = num_unique_problems * num_generations
+                # reshape: [batch_size, num_reward_funcs] -> [num_unique_problems, num_generations, num_reward_funcs]
+                if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                    # reward std: enabled when num_generations > 1
+                    std_rewards_per_func = all_rewards_per_func.view(-1, num_generations, len(self.reward_funcs)).std(1)
+                
+                for i, reward_func in enumerate(self.reward_funcs):
+                    if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                        reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                    else:
+                        reward_func_name = reward_func.__name__
+                    
+                    # all of each reward: [batch_size, num_reward_funcs]
+                    completion_table[reward_func_name] = all_rewards_per_func[:, i].tolist()
+                    
+                    # mean of each reward: [num_unique_problems, num_reward_funcs]
+                    self._metrics[mode][f"rewards/{reward_func_name}"].extend(mean_rewards_per_func[:, i].tolist())
+                    # std of each reward: [num_unique_problems, num_reward_funcs]
+                    if mode == 'train' or (mode == 'eval' and self.num_eval_generations>1):
+                        self._metrics[mode][f"rewards/{reward_func_name}_std"].extend(std_rewards_per_func[:, i].tolist())
+                
+                # 6.continue Completion examples
+                completion_table["reward"] = all_rewards.tolist()
+                if mode == 'eval':  # no 'mini_batch' in eval mode
+                    del completion_table['mini_batch']
+                
+                # Append current examples to the global buffer: `_completion_examples`
+                self._completion_examples[mode].append(completion_table)
     
     
     def _get_batch_logps(self, prompt_completion_ids, attention_mask, logits_to_keep):
@@ -1643,7 +1647,8 @@ class GRPOTrainer(Trainer):
             # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
         """
         
-        self.mode = 'eval'
+        mode = 'eval'
+        self.mode = mode
         
         # handle multipe eval datasets
         # TODO: add support for list of eval datasets
@@ -1760,6 +1765,31 @@ class GRPOTrainer(Trainer):
             gc.collect()
             torch.cuda.empty_cache()
         
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
+        # torch.distributed.breakpoint(rank=1)
+        
+        # Remove redundant eval samples (in main process only)
+        # Note: This is important for the eval metrics for multi-device eval.
+        # Example:
+        # Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
+        # if eval batch size is set to be 5, then we will have 2 batches: 
+        # [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
+        # We need to remove the redundant samples in the last batch.
+        if self.accelerator.is_main_process:
+            num_samples = len(eval_dataset)
+            keyword = list(self._metrics[mode].keys())[0]
+            num_total_samples = len(self._metrics[mode][keyword])
+            if num_total_samples > num_samples:
+                # new_dic = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
+                # {k:len(v) for k,v in new_dic.items()}
+                self._metrics[mode] = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
+                
+                num_redundant = num_total_samples - num_samples
+                self._completion_examples[mode][-1] = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}
+                # new_dic = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}
+                # {k:len(v) for k,v in new_dic.items()}
+        
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
         self.gather_function = self.accelerator.gather_for_metrics
         if args.past_index and hasattr(self, "_past"):
@@ -1778,7 +1808,7 @@ class GRPOTrainer(Trainer):
         
         # log/print eval metrics
         if self.accelerator.is_main_process:
-            mode = 'eval'
+            # mode = 'eval'
             metrics['global_step'] = self.state.global_step
             # Prefix all keys with metric_key_prefix + '_'
             for k, vals in self._metrics[mode].items():
