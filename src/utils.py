@@ -85,12 +85,24 @@ def get_tokenizer(
 
 def get_dataset(dataset_name, split='train', system_prompt=None):
 
-    if dataset_name == 'openai/gsm8k':
-        dataset = load_dataset(dataset_name, name='main', split=split)
-    elif dataset_name == 'opencompass/AIME2025':
-        dataset = load_dataset(dataset_name, name='AIME2025-I', split=split)
+     # Check if the input is a local file or directory
+    if os.path.exists(dataset_name):
+        print(f"Loading local dataset from: {dataset_name}")
+        # Load local dataset
+        dataset = load_dataset(
+            'json' if dataset_name.endswith('.jsonl') else 'csv',  # Infer format
+            data_files=dataset_name,
+            split=split
+        )
     else:
-        dataset = load_dataset(dataset_name, split=split)
+        print(f"Loading remote dataset from Hugging Face Hub: {dataset_name}")
+        # Change the following accordingly
+        if dataset_name == 'openai/gsm8k':
+            dataset = load_dataset(dataset_name, name='main', split=split)
+        elif dataset_name == 'opencompass/AIME2025':
+            dataset = load_dataset(dataset_name, name='AIME2025-I', split=split)
+        else:
+            dataset = load_dataset(dataset_name, split=split)
     
     columns = dataset.column_names
     
