@@ -919,13 +919,14 @@ class GRPOTrainer(Trainer):
 
                     # Check if current model generation meets specific criterion(s)
                     if self.check_model_generation(grpo_inputs):
-                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is good.")
+                        # logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is good.")
+                        logger.info(f"\n  [attempt={attempt}]: Current model generation is good.")
                         break
                     elif attempt == max_attempts:
-                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
+                        logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
                     else:
-                        logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is not good, try again...")
-                 
+                        logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, try again...")
+                
                 # Get per token logps (old_per_token_logps and ref_per_token_logps)
                 # Note: call `_get_batch_logps` after the last attempt.
                 # Concatenate prompt with completion for logit computation: (B, P+C)
@@ -1074,6 +1075,7 @@ class GRPOTrainer(Trainer):
 
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
+
         return {
             # 1. text
             "problems": problems,
@@ -1444,7 +1446,8 @@ class GRPOTrainer(Trainer):
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
-        logits /= self.temperature      # scale logits by the sampling temperature
+        # logits /= (self.temperature + 1e-7) # scale logits by the sampling temperature
+        logits /= self.temperature          # scale logits by the sampling temperature
         return selective_log_softmax(logits, input_ids)     # compute logprobs for the input tokens
     
     
@@ -1716,8 +1719,8 @@ class GRPOTrainer(Trainer):
             elif args.bf16_full_eval:
                 model = model.to(dtype=torch.bfloat16, device=args.device)
         
-        batch_size = self.args.eval_batch_size
-        
+        # batch_size = self.args.eval_batch_size
+        effective_batch_size = self.args.per_device_eval_batch_size * self.accelerator.num_processes
         logger.info("\n\n***** Evaluate *****")
         logger.info(f"***** Running {description} *****")
         if has_length(dataloader):
@@ -1726,10 +1729,12 @@ class GRPOTrainer(Trainer):
         else:
             logger.info("  Num examples: Unknown")
         logger.info(f"  Num generations = {self.num_eval_generations}")
-        logger.info(f"  Batch size = {batch_size}")
+        # logger.info(f"  Batch size = {batch_size}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_eval_batch_size}")
+        logger.info(f"  Total eval batch size = {effective_batch_size}")
         if has_length(dataloader):
-            num_update_steps_per_epoch = math.ceil(num_examples * self.num_eval_generations / batch_size)
-            logger.info(f"  Num updates per epoch = {num_update_steps_per_epoch}")
+            num_update_steps_per_epoch = math.ceil(num_examples * self.num_eval_generations / effective_batch_size)
+            logger.info(f"  Num updates per epoch (ceiled) = {num_update_steps_per_epoch}")
         logger.info(f"  Max completion length  = {self.max_eval_completion_length}")
 
         model.eval()
@@ -1781,9 +1786,9 @@ class GRPOTrainer(Trainer):
             keyword = list(self._metrics[mode].keys())[0]
             num_total_samples = len(self._metrics[mode][keyword])
             if num_total_samples > num_samples:
-                # new_dic = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
-                # {k:len(v) for k,v in new_dic.items()}
-                self._metrics[mode] = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
+                new_dic = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
+                self._metrics[mode].update(new_dic)     # update eval dict
+                
                 
                 num_redundant = num_total_samples - num_samples
                 self._completion_examples[mode][-1] = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}

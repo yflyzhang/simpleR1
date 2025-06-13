@@ -194,7 +194,7 @@ Or override additional parameters via command line. For example,
 CUDA_VISIBLE_DEVICES=0,1,2 \  # assume we have 3 gpus
 accelerate launch \
     --main_process_port $MASTER_PORT \
-    --config_file configs/accelerate_configs/zero1.yaml \
+    --config_file configs/accelerate_configs/ddp.yaml \
     --num_processes=2 \       # cuda:2 is reserved for vllm generation
 src/run_grpo.py \
     --config configs/grpo_template.yaml \
