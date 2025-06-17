@@ -391,6 +391,8 @@ class GRPOTrainer(Trainer):
         self.eval_min_p = args.eval_min_p if args.eval_min_p is not None else args.min_p
         
         self.use_vllm = args.use_vllm
+        self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
+        self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
         
         # Multi-step
         self.num_iterations = args.num_iterations   # = 𝜇 in the GRPO paper
@@ -484,105 +486,101 @@ class GRPOTrainer(Trainer):
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
                     "`pip install vllm==xxx` to use it."
                 )
+            
+            # self.vllm_mode == "colocate":
+            # `"colocate"`: vLLM will run in the same process and share the training GPUs. This avoids the need for a
+            #   separate server but may cause resource contention with training.
 
-            if self.accelerator.is_main_process:
-                vllm_device = self.args.vllm_device
-                device_type = PartialState().default_device.type
-                device_module = getattr(torch, device_type)
-                if vllm_device == "auto":
-                    if device_module.device_count() == 1:
-                        vllm_device = f"{device_type}:0"  # particular case when training with only 1 device: share it
-                    else:
-                        vllm_device = f"{device_type}:{self.accelerator.num_processes}"  # take the next GPU idx
-                
-                logger.info(f"{vllm_device=}")
-                
-                # Check that the requested device is available
-                if (
-                    vllm_device.split(":")[0] == f"{device_type}"
-                    and int(vllm_device.split(":")[1]) >= device_module.device_count()
-                ):
-                    raise ValueError(
-                        f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
-                        "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
-                        "value lower than the number of GPUs available on your machine—typically, reducing it by one "
-                        f"is sufficient. In your case: `--num_processes {device_module.device_count() - 1}`."
-                    )
-                # Check that the requested device is not also used for training
-                if vllm_device in {f"{device_type}:{idx}" for idx in range(self.accelerator.num_processes)}:
-                    warnings.warn(
-                        f"The requested device {vllm_device} is also being used for training. For higher throughput "
-                        "and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. "
-                        "If this is intentional, you may ignore this warning but should adjust "
-                        "`vllm_gpu_memory_utilization` accordingly."
-                    )
-                # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
-                # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
-                # setting (profiling_patch).
-                world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-                profiling_patch = patch(
-                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
+            # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
+            # the same number of ranks
+            if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
+                raise ValueError(
+                    f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
+                    f"({self.accelerator.num_processes}) evenly."
+                )
+            
+            if self.vllm_tensor_parallel_size > 1:
+                # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
+                # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
+                self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+                    [
+                        list(range(i * self.vllm_tensor_parallel_size, (i + 1) * self.vllm_tensor_parallel_size))
+                        for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
+                    ]
                 )
 
-                # For Ascend NPU (torch-npu), collective communication requires the establishment of a communication
-                # group, and different processes must hold the same group number. However, multiple process groups will
-                # be created internally within vLLM. This will cause the group id of the communication group on rank 0
-                # to be different from that of other ranks, causing backward to hang on because the communication
-                # domain cannot be established. So we need to patch it to make sure the group id of different ranks in
-                # the training phase are the same.
-                @contextlib.contextmanager
-                def new_group_context():
-                    new_group = torch.distributed.new_group
-                    try:
-                        torch.distributed.new_group = functools.partial(new_group, use_local_synchronization=True)
-                        torch.npu.mem_get_info = functools.partial(torch.npu.mem_get_info, device=vllm_device)
-                        yield
-                    finally:
-                        torch.distributed.new_group = new_group
+            
+            self.llm = LLM(
+                model=model.name_or_path,
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                max_num_seqs=self.args.per_device_train_batch_size
+                * self.vllm_tensor_parallel_size
+                * self.args.gradient_accumulation_steps,
+                max_model_len=self.max_prompt_length + self.max_completion_length,
+                distributed_executor_backend="external_launcher",
+                # Feed identical seed for tp groups to ensure sampling results are the same across workers
+                seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
+                # max_num_batched_tokens=4096,
+            )
 
-                new_group_patch = new_group_context() if device_type == "npu" else contextlib.nullcontext()
-                with world_size_patch, profiling_patch, new_group_patch:
-                    self.llm = LLM(
-                        model=model.name_or_path,
-                        device=vllm_device,
-                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                        # dtype=self.args.vllm_dtype,
-                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                        # This is particularly useful here because we generate completions from the same prompts.
-                        enable_prefix_caching=self.args.vllm_enable_prefix_caching,
-                        max_model_len=self.args.vllm_max_model_len,
-                    )
+            # self.llm = LLM(
+            #     model=model.name_or_path,
+            #     device=vllm_device,
+            #     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+            #     # dtype=self.args.vllm_dtype,
+            #     # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+            #     # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+            #     # This is particularly useful here because we generate completions from the same prompts.
+            #     enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+            #     max_model_len=self.args.vllm_max_model_len,
+            # )
+            
+            
+            # Guided decoding, if enabled
+            if args.vllm_guided_decoding_regex is not None:
+                guided_decoding = GuidedDecodingParams(backend="outlines", regex=args.vllm_guided_decoding_regex)
+            else:
+                guided_decoding = None
+            
+            # Sampling parameters
+            self.sampling_params = SamplingParams(
+                max_tokens=self.max_completion_length,
+                guided_decoding=guided_decoding,
+                # n=args.num_generations,
+                n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=-1 if args.top_k is None else args.top_k,
+                min_p=0.0 if args.min_p is None else args.min_p,
+                repetition_penalty=args.repetition_penalty,
+            )
 
-                # Guided decoding, if enabled
-                if args.vllm_guided_decoding_regex is not None:
-                    guided_decoding = GuidedDecodingParams(backend="outlines", regex=args.vllm_guided_decoding_regex)
-                else:
-                    guided_decoding = None
-                
-                # Sampling parameters
-                self.sampling_params = SamplingParams(
-                    max_tokens=self.max_completion_length,
-                    guided_decoding=guided_decoding,
-                    n=args.num_generations,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=-1 if args.top_k is None else args.top_k,
-                    min_p=0.0 if args.min_p is None else args.min_p,
-                    repetition_penalty=args.repetition_penalty,
-                )
-
-                # Eval sampling parameters
-                self.eval_sampling_params = SamplingParams(
-                    max_tokens=self.max_eval_completion_length,
-                    guided_decoding=guided_decoding,
-                    n=args.num_eval_generations,
-                    temperature=args.eval_temperature,
-                    top_p=args.eval_top_p,
-                    top_k=-1 if args.eval_top_k is None else args.eval_top_k,
-                    min_p=0.0 if args.eval_min_p is None else args.eval_min_p,
-                    repetition_penalty=args.repetition_penalty,
-                )
+            # sampling_params = SamplingParams(
+            #     n=1,  # vLLM on each GPU generates only 1 in colocate mode
+            #     repetition_penalty=self.repetition_penalty,
+            #     temperature=self.temperature,
+            #     top_p=self.top_p,
+            #     top_k=-1 if self.top_k is None else self.top_k,
+            #     min_p=0.0 if self.min_p is None else self.min_p,
+            #     max_tokens=self.max_completion_length,
+            #     guided_decoding=guided_decoding,
+            # )
+            
+            # Eval sampling parameters
+            self.eval_sampling_params = SamplingParams(
+                max_tokens=self.max_eval_completion_length,
+                guided_decoding=guided_decoding,
+                # n=args.num_eval_generations,
+                n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                temperature=args.eval_temperature,
+                top_p=args.eval_top_p,
+                top_k=-1 if args.eval_top_k is None else args.eval_top_k,
+                min_p=0.0 if args.eval_min_p is None else args.eval_min_p,
+                repetition_penalty=args.repetition_penalty,
+            )
+        
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
 
@@ -700,42 +698,104 @@ class GRPOTrainer(Trainer):
 
         return model
     
-
     def _move_model_to_vllm(self):
         r"""Load model state dict to vllm"""
-        with unwrap_model_for_generation(
-            self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-        ) as unwrapped_model:
-            if is_compiled_module(unwrapped_model):
-                unwrapped_model = unwrapped_model._orig_mod
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.merge_adapter()
-                state_dict = unwrapped_model.state_dict()
-                # Remove base_model and base_layer prefixes
-                state_dict = {
-                    k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
-                }
-                # Remove values with adapter prefix (example: "_lora")
-                state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
-                # When module to save, remove its prefix and discard the original module
-                state_dict = {
-                    k.replace("modules_to_save.default.", ""): v
-                    for k, v in state_dict.items()
-                    if "original_module" not in k
-                }
-            else:
-                state_dict = unwrapped_model.state_dict()
-            
-            # # >>>>> add a breakpoint for debug? <<<<<
-            # torch.distributed.breakpoint(rank=0)
 
-            if self.accelerator.is_main_process:
-                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                llm_model.load_weights(state_dict.items())
-            # Unmerge the adapter to restore the model to its original state.
-            # This must be done after loading weights to ensure they correspond to the merged state.
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.unmerge_adapter()
+        from contextlib import nullcontext
+        logger.warning("Moving model to vllm")
+
+        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        if zero_stage_3:
+            import deepspeed
+
+            gather_if_zero3 = deepspeed.zero.GatheredParameters
+        else:
+            gather_if_zero3 = nullcontext
+        
+        if is_peft_model(self.model):
+            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
+            # merging adapters in a sharded manner is not supported.
+            # TODO: does this work with FSDP?
+            raise ValueError("PEFT is not supported now.")
+        else:
+            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
+            for name, param in self.model.named_parameters():
+                with gather_if_zero3([param]):
+                    # if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                    #     self.vllm_client.update_named_param(name, param.data)
+                    # elif self.vllm_mode == "colocate":
+                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                    llm_model.load_weights([(name, param.data)])
+        
+        # Reset cache on vLLM
+        # if self.vllm_mode == "server" and self.accelerator.is_main_process:
+        #     self.vllm_client.reset_prefix_cache()
+        # elif self.vllm_mode == "colocate":
+        self.llm.reset_prefix_cache()
+        
+
+    # def _move_model_to_vllm(self):
+    #     r"""Load model state dict to vllm"""
+    #     logger.info("Moving model to vllm")
+
+    #     with unwrap_model_for_generation(
+    #         self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+    #     ) as unwrapped_model:
+    #         if is_compiled_module(unwrapped_model):
+    #             unwrapped_model = unwrapped_model._orig_mod
+    #         if is_peft_model(unwrapped_model):
+    #             unwrapped_model.merge_adapter()
+    #             state_dict = unwrapped_model.state_dict()
+    #             # Remove base_model and base_layer prefixes
+    #             state_dict = {
+    #                 k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
+    #             }
+    #             # Remove values with adapter prefix (example: "_lora")
+    #             state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
+    #             # When module to save, remove its prefix and discard the original module
+    #             state_dict = {
+    #                 k.replace("modules_to_save.default.", ""): v
+    #                 for k, v in state_dict.items()
+    #                 if "original_module" not in k
+    #             }
+    #         else:
+    #             state_dict = unwrapped_model.state_dict()
+
+    #         if self.accelerator.is_main_process:
+    #             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+    #             llm_model.load_weights(state_dict.items())
+    #         # Unmerge the adapter to restore the model to its original state.
+    #         # This must be done after loading weights to ensure they correspond to the merged state.
+    #         if is_peft_model(unwrapped_model):
+    #             unwrapped_model.unmerge_adapter()
+            
+            
+
+            # # >>>>> add a breakpoint for debug? <<<<<
+            # logger.info("[_move_model_to_vllm] state_dict keys: {}".format(state_dict.keys()))
+            # torch.distributed.breakpoint(rank=0)
+            
+
+            # # torch.testing.assert_close(actual, expected)
+            # torch.testing.assert_close(state_dict, llm_model.state_dict())
+
+            # keys1 = set(state_dict.keys())
+            # keys2 = set(llm_model.state_dict().keys())
+            
+            # len(keys1), len(keys2)
+            # len(keys1 - keys2)
+            # len(keys2 - keys1)
+            
+            # sorted(keys1 - keys2)
+            # sorted(keys2 - keys1)
+            
+            # {k:v.shape for k,v in state_dict.items() if len(v) < 1}
+
+            # sorted(list(keys1))
+            # sorted(list(keys2))[:10]
+            
     
     def get_train_dataloader(self) -> DataLoader:
         r"""
@@ -989,50 +1049,91 @@ class GRPOTrainer(Trainer):
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
-
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
-                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                # prompt individually.
-                
-                # vllm generate
-                if mode == 'train':
-                    sampling_params = self.sampling_params
-                    num_generations = self.num_generations
-                else:       # eval mode
-                    sampling_params = self.eval_sampling_params
-                    num_generations = self.num_eval_generations
-
-                ordered_set_of_prompts = all_prompts_text[::num_generations]
-                all_outputs = self.llm.generate(
-                    ordered_set_of_prompts, 
-                    sampling_params=sampling_params, 
-                    use_tqdm=False
-                )
-
-                all_completion_ids = []
-                all_completion_texts = []
-                for outputs in all_outputs:
-                    for output in outputs.outputs:
-                        all_completion_ids.append(output.token_ids)
-                        all_completion_texts.append(output.text)
-
+            
+            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+            # if self.vllm_mode == "colocate":
+            # vllm generate
+            if mode == 'train':
+                sampling_params = self.sampling_params
+                num_generations = self.num_generations
+            else:       # eval mode
+                sampling_params = self.eval_sampling_params
+                num_generations = self.num_eval_generations
+            
+            # all_prompts_text = prompts_text
+            if self.vllm_tensor_parallel_size > 1:
+                # Gather prompts from all ranks in the TP group and flatten.
+                # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
+                orig_size = len(prompts_text)
+                gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
+                torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
+                all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
             else:
-                all_completion_ids = [None] * len(all_prompts_text)
-                all_completion_texts = [None] * len(all_prompts_text)
-            
-            # Broadcast the completions from the main process to all processes, 
-            # ensuring each process receives its corresponding slice.
-            all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
-            all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
-            
-            # Keep only the local part of the data
-            start = self.accelerator.process_index * len(prompts)
-            completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
-            completions_text = all_completion_texts[start:start+len(prompts)]
+                all_prompts_text = prompts_text
 
+
+            all_outputs = self.llm.generate(
+                all_prompts_text, sampling_params=sampling_params, use_tqdm=False
+            )
+
+            completion_ids = []
+            completion_texts = []
+            for outputs in all_outputs:
+                for output in outputs.outputs:
+                    completion_ids.append(output.token_ids)
+                    completion_texts.append(output.text)
+            
+            
+            # # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            # all_prompts_text = gather_object(prompts_text)
+            # if self.accelerator.is_main_process:
+            #     # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+            #     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+            #     # prompt individually.
+                
+            #     # vllm generate
+            #     if mode == 'train':
+            #         sampling_params = self.sampling_params
+            #         num_generations = self.num_generations
+            #     else:       # eval mode
+            #         sampling_params = self.eval_sampling_params
+            #         num_generations = self.num_eval_generations
+
+            #     ordered_set_of_prompts = all_prompts_text[::num_generations]
+            #     all_outputs = self.llm.generate(
+            #         ordered_set_of_prompts, 
+            #         sampling_params=sampling_params, 
+            #         use_tqdm=False
+            #     )
+
+            #     all_completion_ids = []
+            #     all_completion_texts = []
+            #     for outputs in all_outputs:
+            #         for output in outputs.outputs:
+            #             all_completion_ids.append(output.token_ids)
+            #             all_completion_texts.append(output.text)
+
+            # else:
+            #     all_completion_ids = [None] * len(all_prompts_text)
+            #     all_completion_texts = [None] * len(all_prompts_text)
+            
+            # # Broadcast the completions from the main process to all processes, 
+            # # ensuring each process receives its corresponding slice.
+            # all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
+            # all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
+            
+            # # Keep only the local part of the data
+            # start = self.accelerator.process_index * len(prompts)
+            # completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
+            # completion_texts = all_completion_texts[start:start+len(prompts)]
+            
+            if self.vllm_tensor_parallel_size > 1:
+                # Slice completions for this rank within its TP group.
+                # Each rank generates all outputs — we keep only our share.
+                local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                completion_ids = completion_ids[tp_slice]
+            
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
@@ -1049,7 +1150,7 @@ class GRPOTrainer(Trainer):
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
             # Decode the generated completions
-            completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -1063,15 +1164,15 @@ class GRPOTrainer(Trainer):
             completion_mask = completion_mask * is_eos.any(dim=1).unsqueeze(1).int()
         
         # Process the generated completions
-        # completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        # completion_texts = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = []
-            for prompt, completion in zip(prompts, completions_text):
+            for prompt, completion in zip(prompts, completion_texts):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])  # multi-turn support
                 # completions.append({"role": "assistant", "content": bootstrap + completion})    # single-turn only
         else:
-            completions = completions_text
+            completions = completion_texts
 
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
@@ -1310,10 +1411,10 @@ class GRPOTrainer(Trainer):
         
         # 3. Completion text (may extract from conversational message)
         if is_messages(completions[0]):
-            completions_text = [example[0]['content'] for example in completions]
-            # completions_text = [example['content'] for example in completions]
+            completion_texts = [example[0]['content'] for example in completions]
+            # completion_texts = [example['content'] for example in completions]
         else:
-            completions_text = completions
+            completion_texts = completions
         
         if (
             self.log_completions and 
@@ -1361,7 +1462,7 @@ class GRPOTrainer(Trainer):
                 "mini_batch": [self.mini_batch_step+1] * len(all_completions_length),
                 "problem": gather_object(problems_text),
                 "solution": gather_object(solutions_text),
-                "completion": gather_object(completions_text),
+                "completion": gather_object(completion_texts),
                 "completion_length": all_completions_length.tolist(),
                 # "reward": all_rewards.tolist(),
             }
@@ -2150,6 +2251,9 @@ class GRPOTrainer(Trainer):
 
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
+        
+        # # >>>>> add a breakpoint for debug? <<<<<
+        # torch.distributed.breakpoint(rank=0)
 
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader

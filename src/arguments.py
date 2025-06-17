@@ -477,6 +477,15 @@ class GRPOTrainingArguments(trl.GRPOConfig):
         },
     )
 
+    vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
+            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
+            "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
+    )
+
 
 
 @dataclass
