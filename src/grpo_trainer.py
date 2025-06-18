@@ -64,7 +64,7 @@ from transformers.utils import is_peft_available
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 # from trl.extras.profiling import profiling_context, profiling_decorator
-from trl.import_utils import is_rich_available, is_vllm_available
+from trl.import_utils import is_vllm_available
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.callbacks import SyncRefModelCallback
 from trl.trainer.grpo_config import GRPOConfig
@@ -508,23 +508,24 @@ class GRPOTrainer(Trainer):
                         for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
                     ]
                 )
-
             
+            # Setup vLLM
             self.llm = LLM(
                 model=model.name_or_path,
-                tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                max_num_seqs=self.args.per_device_train_batch_size
-                * self.vllm_tensor_parallel_size
-                * self.args.gradient_accumulation_steps,
-                max_model_len=self.max_prompt_length + self.max_completion_length,
-                distributed_executor_backend="external_launcher",
+                tensor_parallel_size=args.vllm_tensor_parallel_size,
+                distributed_executor_backend="external_launcher",   # important for tp
+                # max_num_seqs=self.args.per_device_eval_batch_size 
+                #             * self.vllm_tensor_parallel_size
+                #             * self.args.gradient_accumulation_steps,
+                # max_model_len=self.max_prompt_length + self.max_eval_completion_length,
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
+                # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                seed=self.args.seed,
+                # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                 # max_num_batched_tokens=4096,
             )
-
+            
             # self.llm = LLM(
             #     model=model.name_or_path,
             #     device=vllm_device,
@@ -544,12 +545,12 @@ class GRPOTrainer(Trainer):
             else:
                 guided_decoding = None
             
-            # Sampling parameters
+            # Sampling parameters for training
             self.sampling_params = SamplingParams(
-                max_tokens=self.max_completion_length,
-                guided_decoding=guided_decoding,
                 # n=args.num_generations,
                 n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                max_tokens=self.max_completion_length,
+                guided_decoding=guided_decoding,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=-1 if args.top_k is None else args.top_k,
@@ -568,17 +569,17 @@ class GRPOTrainer(Trainer):
             #     guided_decoding=guided_decoding,
             # )
             
-            # Eval sampling parameters
+            # Sampling parameters for evaluation
             self.eval_sampling_params = SamplingParams(
-                max_tokens=self.max_eval_completion_length,
-                guided_decoding=guided_decoding,
                 # n=args.num_eval_generations,
                 n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                max_tokens=self.max_eval_completion_length,
                 temperature=args.eval_temperature,
                 top_p=args.eval_top_p,
                 top_k=-1 if args.eval_top_k is None else args.eval_top_k,
                 min_p=0.0 if args.eval_min_p is None else args.eval_min_p,
                 repetition_penalty=args.repetition_penalty,
+                guided_decoding=guided_decoding,
             )
         
 
@@ -702,8 +703,8 @@ class GRPOTrainer(Trainer):
         r"""Load model state dict to vllm"""
 
         from contextlib import nullcontext
-        logger.warning("Moving model to vllm")
-
+        logger.warning(f"[rank={self.accelerator.process_index}] Moving model to vllm")
+        
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
@@ -738,7 +739,7 @@ class GRPOTrainer(Trainer):
 
     # def _move_model_to_vllm(self):
     #     r"""Load model state dict to vllm"""
-    #     logger.info("Moving model to vllm")
+    #     logger.warning(f"[rank={self.accelerator.process_index}] Moving model to vllm")
 
     #     with unwrap_model_for_generation(
     #         self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
@@ -1073,7 +1074,9 @@ class GRPOTrainer(Trainer):
 
 
             all_outputs = self.llm.generate(
-                all_prompts_text, sampling_params=sampling_params, use_tqdm=False
+                all_prompts_text, 
+                sampling_params=sampling_params, 
+                use_tqdm=False
             )
 
             completion_ids = []
@@ -1134,7 +1137,7 @@ class GRPOTrainer(Trainer):
                 tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
                 completion_ids = completion_ids[tp_slice]
             
-            # Pad the completions, and concatenate them with the prompts
+            # Pad the completions
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
         else:
