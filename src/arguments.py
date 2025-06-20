@@ -362,12 +362,19 @@ class GRPOTrainingArguments(TrainingArguments):
     command line.
     """
     
-     # Parameters that control the model and reference model
+    # Parameters that control the model and reference model
     model_init_kwargs: Optional[dict] = field(
         default=None,
         metadata={
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
             "argument of the `GRPOTrainer` is provided as a string."
+        },
+    )
+    disable_dropout: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to disable dropout in the model. This is useful for training with a reference model, as "
+            "it prevents the model from generating different logprobs for the same input."
         },
     )
 
@@ -407,6 +414,11 @@ class GRPOTrainingArguments(TrainingArguments):
             "is not compatible with vLLM generation."
         },
     )
+    shuffle_dataset: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Whether to shuffle the training dataset."},
+    )
+
 
     # Parameters that control generation
     temperature: float = field(
@@ -455,24 +467,61 @@ class GRPOTrainingArguments(TrainingArguments):
             "running. To run the server, install vLLM (`pip install vllm`) and run `trl vllm-serve`."
         },
     )
-    vllm_server_host: str = field(
-        default="0.0.0.0",
-        metadata={"help": "Host of the vLLM server to connect to."},
-    )
-    vllm_server_port: int = field(
-        default=8000,
-        metadata={"help": "Port of the vLLM server to connect to."},
-    )
-    vllm_server_timeout: float = field(
-        default=120.0,
+    vllm_server_base_url: Optional[str] = field(
+        default=None,
         metadata={
-            "help": "Total timeout duration in seconds to wait for the vLLM server to be up. If the server is not up "
-            "after the timeout, a `ConnectionError` is raised."
+            "help": "Base URL for the vLLM server (e.g., 'http://localhost:8000'). If provided, `vllm_server_host` "
+            "and `vllm_server_port` are ignored."
+        },
+    )
+    vllm_mode: str = field(
+        default="server",
+        metadata={
+            "help": "Mode to use for vLLM integration when `use_vllm` is set to `True`. Must be one of `server` or "
+            "`'colocate'`. `'server'`: The trainer will send generation requests to a separate vLLM server. Make sure a "
+            "TRL vLLM server is running (start with `trl vllm-serve`). `'colocate'`: vLLM will run in the same "
+            "process and share the training GPUs. This avoids the need for a separate server but may cause resource "
+            "contention with training."
         },
     )
     vllm_guided_decoding_regex: Optional[str] = field(
         default=None,
         metadata={"help": "Regex for vLLM guided decoding. If `None` (default), guided decoding is disabled."},
+    )
+
+     # Parameters that control the vLLM server (only used when `vllm_mode` is `"server"`)
+    vllm_server_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "Host of the vLLM server to connect to. Ignored if vllm_server_base_url is provided."},
+    )
+    vllm_server_port: int = field(
+        default=8000,
+        metadata={"help": "Port of the vLLM server to connect to. Ignored if vllm_server_base_url is provided."},
+    )
+    vllm_server_timeout: float = field(
+        default=240.0,
+        metadata={
+            "help": "Total timeout duration in seconds to wait for the vLLM server to be up. If the server is not up "
+            "after the timeout, a `ConnectionError` is raised."
+        },
+    )
+
+    # Parameters that control colocated vLLM execution (only used when `vllm_mode` is `"colocate"`)
+    vllm_gpu_memory_utilization: float = field(
+        default=0.3,
+        metadata={
+            "help": "Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set "
+            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
+            "launching the vLLM server via the `--vllm_gpu_memory_utilization` flag."
+        },
+    )
+    vllm_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
+            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
+            "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
     )
 
     # Parameters that control the training
@@ -512,6 +561,30 @@ class GRPOTrainingArguments(TrainingArguments):
             "rewards are weighted equally with weight `1.0`."
         },
     )
+    loss_type: str = field(
+        default="bnpo",
+        metadata={
+            "help": "Specifies the loss formulation to use. Supported values are `grpo`, `bnpo`, and `dr_grpo`. "
+            "`'grpo'`: Aggregates token-level losses by normalizing over sequence length. Not recommended due to "
+            "length bias—this approach tends to prefer shorter completions with positive advantages and longer ones "
+            "with negative advantages. "
+            "`'bnpo'`: Aggregates token-level losses by normalizing number of active token in the local batch. "
+            "Note that normalization is performed over the local batch only, so results may slightly vary depending "
+            "on the local batch size, despite a constant effective batch size. When using "
+            "`per_device_train_batch_size==1`, the loss is equivalent to the GRPO loss. "
+            "`'dr_grpo'`: Aggregates token-level losses by normalizing with a global constant. This method was "
+            "introduced in the Dr. GRPO paper to eliminate length bias. The value of the constant corresponds to "
+            "`max_completion_length`."
+        },
+    )
+    mask_truncated_completions: bool = field(
+        default=False,
+        metadata={
+            "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
+            "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "
+            "a good practice for training stability."
+        },
+    )
     scale_rewards: bool = field(
         default=True,
         metadata={
@@ -520,6 +593,14 @@ class GRPOTrainingArguments(TrainingArguments):
             "scaling is applied. The Dr. GRPO paper recommends not scaling the rewards, as scaling by the standard "
             "deviation introduces a question-level difficulty bias."
         },
+    )
+    max_resample_attempts: int = field(
+        default=10,
+        metadata={"help": "Max number of attempts per prompt in model generation."},
+    )
+    compute_kl: bool = field(
+        default=False, 
+        metadata={"help": "Whether to compute kl even when beta=0. This helps to monitor model update."}
     )
     sync_ref_model: bool = field(
         default=False,
@@ -544,141 +625,8 @@ class GRPOTrainingArguments(TrainingArguments):
         },
     )
 
-    # Parameters that control the logging
-    log_completions: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is "
-            "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
-        },
-    )
-
-    # Deprecated parameters
-    vllm_device: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.18.0. To use vLLM, start a vLLM "
-            "server with the `trl vllm-serve` command."
-        },
-    )
-    vllm_gpu_memory_utilization: Optional[float] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control the GPU memory "
-            "utilization for vLLM, you should now use the `gpu_memory_utilization` parameter in the vLLM server "
-            "configuration."
-        },
-    )
-    vllm_dtype: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control the data type for "
-            "vLLM generation, you should now use the `dtype` parameter in the vLLM server configuration."
-        },
-    )
-    vllm_max_model_len: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control the "
-            "`max_model_len` for vLLM, you should now use the `max_model_len` parameter in the vLLM server "
-            "configuration."
-        },
-    )
-    vllm_enable_prefix_caching: Optional[bool] = field(
-        default=None,
-        metadata={
-            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control prefix caching in "
-            "vLLM, you should now use the `enable_prefix_caching` parameter in the vLLM server configuration."
-        },
-    )
-
     
-    disable_dropout: bool = field(
-        default=True,
-        metadata={"help": "Whether to disable dropout in the model and reference model."},
-    )
-    
-    num_iterations: int = field(
-        default=1,
-        metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
-    )
-
-    max_resample_attempts: int = field(
-        default=10,
-        metadata={"help": "Max number of attempts per prompt in model generation."},
-    )
-    
-    epsilon: float = field(
-        default=0.2,
-        metadata={"help": "Epsilon value for clipping."},
-    )
-
-    benchmarks: list[str] = field(
-        default_factory=lambda: [], metadata={"help": "The benchmarks to run after training."}
-    )
-    callbacks: list[str] = field(
-        default_factory=lambda: [], metadata={"help": "The callbacks to run during training."}
-    )
-    chat_template: Optional[str] = field(
-        default=None, 
-        metadata={"help": "The chat template to use."}
-    )
-    system_prompt: Optional[str] = field(
-        default=None,
-        metadata={"help": "The optional system prompt to use."},
-    )
-    hub_model_revision: Optional[str] = field(
-        default="main", metadata={"help": "The Hub model branch to push the model to."}
-    )
-    overwrite_hub_revision: bool = field(
-        default=False, 
-        metadata={"help": "Whether to overwrite the Hub revision."}
-    )
-    push_to_hub_revision: bool = field(
-        default=False, 
-        metadata={"help": "Whether to push to a Hub revision/branch."}
-    )
-    wandb_entity: Optional[str] = field(
-        default=None,
-        metadata={"help": ("The entity to store runs under.")},
-    )
-    wandb_project: Optional[str] = field(
-        default=None,
-        metadata={"help": ("The project to store runs under.")},
-    )
-
-    compute_kl: bool = field(
-        default=False, 
-        metadata={"help": "Whether to compute kl even when beta=0. This helps to monitor model update."}
-    )
-
-    mask_truncated_completions: bool = field(
-        default=False,
-        metadata={
-            "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
-            "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "
-            "a good practice for training stability."
-        },
-    )
-
-    loss_type: str = field(
-        default="bnpo",
-        metadata={
-            "help": "Specifies the loss formulation to use. Supported values are `grpo`, `bnpo`, and `dr_grpo`. "
-            "`'grpo'`: Aggregates sequence-level losses by normalizing over sequence length. Not recommended due to "
-                "length bias—this approach tends to prefer shorter completions with positive advantages and longer ones "
-                "with negative advantages. "
-            "`'bnpo'`: Aggregates token-level losses by normalizing number of active token in the local batch. "
-                "Note that normalization is performed over the local batch only, so results may slightly vary depending "
-                "on the local batch size, despite a constant effective batch size. When using "
-                "`per_device_train_batch_size==1`, the loss is equivalent to the GRPO loss. "
-            "`'dr_grpo'`: Aggregates token-level losses by normalizing with a global constant. This method was "
-                "introduced in the Dr. GRPO paper to eliminate length bias. The value of the constant corresponds to "
-                "`max_completion_length`."
-        },
-    )
-
-    # Eval parameters
+    # Parameters that control the evaluation
     num_eval_generations: Optional[int] = field(
         default=None,
         metadata={
@@ -716,14 +664,84 @@ class GRPOTrainingArguments(TrainingArguments):
         },
     )
 
-    vllm_tensor_parallel_size: int = field(
-        default=1,
+
+    # Parameters that control the logging
+    log_completions: bool = field(
+        default=False,
         metadata={
-            "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
-            "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
-            "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+            "help": "Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is "
+            "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
+
+    # Deprecated parameters
+    vllm_device: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "This parameter is deprecated and will be removed in version 0.18.0. To use vLLM, start a vLLM "
+            "server with the `trl vllm-serve` command."
+        },
+    )
+    vllm_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control the data type for "
+            "vLLM generation, you should now use the `dtype` parameter in the vLLM server configuration."
+        },
+    )
+    vllm_max_model_len: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control the "
+            "`max_model_len` for vLLM, you should now use the `max_model_len` parameter in the vLLM server "
+            "configuration."
+        },
+    )
+    vllm_enable_prefix_caching: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "This parameter is deprecated and will be removed in version 0.18.0. To control prefix caching in "
+            "vLLM, you should now use the `enable_prefix_caching` parameter in the vLLM server configuration."
+        },
+    )
+
+    
+    
+    # Parameters
+    benchmarks: list[str] = field(
+        default_factory=lambda: [], metadata={"help": "The benchmarks to run after training."}
+    )
+    callbacks: list[str] = field(
+        default_factory=lambda: [], metadata={"help": "The callbacks to run during training."}
+    )
+    chat_template: Optional[str] = field(
+        default=None, 
+        metadata={"help": "The chat template to use."}
+    )
+    system_prompt: Optional[str] = field(
+        default=None,
+        metadata={"help": "The optional system prompt to use."},
+    )
+    hub_model_revision: Optional[str] = field(
+        default="main", metadata={"help": "The Hub model branch to push the model to."}
+    )
+    overwrite_hub_revision: bool = field(
+        default=False, 
+        metadata={"help": "Whether to overwrite the Hub revision."}
+    )
+    push_to_hub_revision: bool = field(
+        default=False, 
+        metadata={"help": "Whether to push to a Hub revision/branch."}
+    )
+    wandb_entity: Optional[str] = field(
+        default=None,
+        metadata={"help": ("The entity to store runs under.")},
+    )
+    wandb_project: Optional[str] = field(
+        default=None,
+        metadata={"help": ("The project to store runs under.")},
+    )
+
 
     def __post_init__(self):
         super().__post_init__()
@@ -735,7 +753,7 @@ class GRPOTrainingArguments(TrainingArguments):
                 f"{self.num_generations}, which is less than the minimum required."
             )
         
-        
+
 
 
 @dataclass

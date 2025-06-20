@@ -90,6 +90,8 @@ if is_wandb_available():
 
 
 from utils import is_messages
+from vllm_client import VLLMClient
+
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -391,6 +393,7 @@ class GRPOTrainer(Trainer):
         self.eval_min_p = args.eval_min_p if args.eval_min_p is not None else args.min_p
         
         self.use_vllm = args.use_vllm
+        self.vllm_mode = args.vllm_mode
         self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
         
@@ -487,56 +490,66 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm==xxx` to use it."
                 )
             
-            # self.vllm_mode == "colocate":
-            # `"colocate"`: vLLM will run in the same process and share the training GPUs. This avoids the need for a
-            #   separate server but may cause resource contention with training.
+            if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                # `"server"`: The trainer will send generation requests to a separate vLLM server. Make sure a TRL vLLM
+                # server is running (start with `trl vllm-serve`).
+                if args.vllm_server_base_url is not None:
+                    base_url = args.vllm_server_base_url
+                else:
+                    base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
+                self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
+                self.vllm_client.init_communicator()
+            
+            elif self.vllm_mode == "colocate":
+                # `"colocate"`: vLLM will run in the same process and share the training GPUs. This avoids the need for a
+                #   separate server but may cause resource contention with training.
 
-            # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
-            # the same number of ranks
-            if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
-                raise ValueError(
-                    f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
-                    f"({self.accelerator.num_processes}) evenly."
+                # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
+                # the same number of ranks
+                if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
+                    raise ValueError(
+                        f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
+                        f"({self.accelerator.num_processes}) evenly."
+                    )
+                
+                if self.vllm_tensor_parallel_size > 1:
+                    # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
+                    # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
+                    self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+                        [
+                            list(range(i * self.vllm_tensor_parallel_size, (i + 1) * self.vllm_tensor_parallel_size))
+                            for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
+                        ]
+                    )
+                
+                # Setup vLLM
+                self.llm = LLM(
+                    model=model.name_or_path,
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                    tensor_parallel_size=args.vllm_tensor_parallel_size,
+                    distributed_executor_backend="external_launcher",   # important for tp
+                    # max_num_seqs=self.args.per_device_eval_batch_size 
+                    #             * self.vllm_tensor_parallel_size
+                    #             * self.args.gradient_accumulation_steps,
+                    # max_model_len=self.max_prompt_length + self.max_eval_completion_length,
+                    # Feed identical seed for tp groups to ensure sampling results are the same across workers
+                    # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                    seed=self.args.seed,
+                    # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
+                    # max_num_batched_tokens=4096,
                 )
-            
-            if self.vllm_tensor_parallel_size > 1:
-                # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
-                # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
-                self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
-                    [
-                        list(range(i * self.vllm_tensor_parallel_size, (i + 1) * self.vllm_tensor_parallel_size))
-                        for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
-                    ]
-                )
-            
-            # Setup vLLM
-            self.llm = LLM(
-                model=model.name_or_path,
-                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                tensor_parallel_size=args.vllm_tensor_parallel_size,
-                distributed_executor_backend="external_launcher",   # important for tp
-                # max_num_seqs=self.args.per_device_eval_batch_size 
-                #             * self.vllm_tensor_parallel_size
-                #             * self.args.gradient_accumulation_steps,
-                # max_model_len=self.max_prompt_length + self.max_eval_completion_length,
-                # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                seed=self.args.seed,
-                # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                # max_num_batched_tokens=4096,
-            )
-            
-            # self.llm = LLM(
-            #     model=model.name_or_path,
-            #     device=vllm_device,
-            #     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-            #     # dtype=self.args.vllm_dtype,
-            #     # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-            #     # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-            #     # This is particularly useful here because we generate completions from the same prompts.
-            #     enable_prefix_caching=self.args.vllm_enable_prefix_caching,
-            #     max_model_len=self.args.vllm_max_model_len,
-            # )
+                
+                # self.llm = LLM(
+                #     model=model.name_or_path,
+                #     device=vllm_device,
+                #     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                #     # dtype=self.args.vllm_dtype,
+                #     # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                #     # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                #     # This is particularly useful here because we generate completions from the same prompts.
+                #     enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+                #     max_model_len=self.args.vllm_max_model_len,
+                # )
             
             
             # Guided decoding, if enabled
@@ -547,15 +560,15 @@ class GRPOTrainer(Trainer):
             
             # Sampling parameters for training
             self.sampling_params = SamplingParams(
-                # n=args.num_generations,
-                n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                n=1 if self.vllm_mode == "colocate" else args.num_generations,  
+                # vLLM on each GPU generates only 1 in colocate mode
                 max_tokens=self.max_completion_length,
-                guided_decoding=guided_decoding,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=-1 if args.top_k is None else args.top_k,
                 min_p=0.0 if args.min_p is None else args.min_p,
                 repetition_penalty=args.repetition_penalty,
+                guided_decoding=guided_decoding,
             )
 
             # sampling_params = SamplingParams(
@@ -571,8 +584,8 @@ class GRPOTrainer(Trainer):
             
             # Sampling parameters for evaluation
             self.eval_sampling_params = SamplingParams(
-                # n=args.num_eval_generations,
-                n=1,  # vLLM on each GPU generates only 1 in colocate mode
+                n=1 if self.vllm_mode == "colocate" else args.num_eval_generations,  
+                # vLLM on each GPU generates only 1 in colocate mode
                 max_tokens=self.max_eval_completion_length,
                 temperature=args.eval_temperature,
                 top_p=args.eval_top_p,
@@ -724,19 +737,19 @@ class GRPOTrainer(Trainer):
             # For non-PEFT models, simply gather (if needed) and update each parameter individually.
             for name, param in self.model.named_parameters():
                 with gather_if_zero3([param]):
-                    # if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                    #     self.vllm_client.update_named_param(name, param.data)
-                    # elif self.vllm_mode == "colocate":
-                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    llm_model.load_weights([(name, param.data)])
+                    if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                        self.vllm_client.update_named_param(name, param.data)
+                    elif self.vllm_mode == "colocate":
+                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                        llm_model.load_weights([(name, param.data)])
         
         # Reset cache on vLLM
-        # if self.vllm_mode == "server" and self.accelerator.is_main_process:
-        #     self.vllm_client.reset_prefix_cache()
-        # elif self.vllm_mode == "colocate":
-        self.llm.reset_prefix_cache()
+        if self.vllm_mode == "server" and self.accelerator.is_main_process:
+            self.vllm_client.reset_prefix_cache()
+        elif self.vllm_mode == "colocate":
+            self.llm.reset_prefix_cache()
         
-
+    
     # def _move_model_to_vllm(self):
     #     r"""Load model state dict to vllm"""
     #     logger.warning(f"[rank={self.accelerator.process_index}] Moving model to vllm")
@@ -1051,92 +1064,161 @@ class GRPOTrainer(Trainer):
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
             
-            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
-            # if self.vllm_mode == "colocate":
-            # vllm generate
-            if mode == 'train':
-                sampling_params = self.sampling_params
-                num_generations = self.num_generations
-            else:       # eval mode
-                sampling_params = self.eval_sampling_params
-                num_generations = self.num_eval_generations
             
-            # all_prompts_text = prompts_text
-            if self.vllm_tensor_parallel_size > 1:
-                # Gather prompts from all ranks in the TP group and flatten.
-                # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                orig_size = len(prompts_text)
-                gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
-                torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
-                all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
-            else:
-                all_prompts_text = prompts_text
-
-
-            all_outputs = self.llm.generate(
-                all_prompts_text, 
-                sampling_params=sampling_params, 
-                use_tqdm=False
-            )
-
-            completion_ids = []
-            completion_texts = []
-            for outputs in all_outputs:
-                for output in outputs.outputs:
-                    completion_ids.append(output.token_ids)
-                    completion_texts.append(output.text)
-            
-            
-            # # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            # all_prompts_text = gather_object(prompts_text)
-            # if self.accelerator.is_main_process:
-            #     # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-            #     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-            #     # prompt individually.
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            if self.vllm_mode == "server":
+                all_prompts_text = gather_object(prompts_text)
+                if self.accelerator.is_main_process:
+                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                    # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                    # prompt individually.
+                    
+                    # vllm generate
+                    if mode == 'train':
+                        sampling_params = self.sampling_params
+                        num_generations = self.num_generations
+                        max_tokens = self.max_completion_length
+                    else:       # eval mode
+                        sampling_params = self.eval_sampling_params
+                        num_generations = self.num_eval_generations
+                        max_tokens = self.max_eval_completion_length
+                    
+                    # ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
+                    ordered_set_of_prompts = all_prompts_text[::num_generations]
+                    
+                    # all_outputs = self.llm.generate(
+                    #     ordered_set_of_prompts, 
+                    #     sampling_params=sampling_params, 
+                    #     use_tqdm=False
+                    # )
+                    
+                    # with profiling_context(self, "vLLM.generate"):
+                    # TODO: Replace the configurations with samling params in vllm_client.generate?
+                    all_outputs = self.vllm_client.generate(
+                        prompts=ordered_set_of_prompts,
+                        sampling_params=sampling_params
+                    )
+                    # all_outputs = {
+                    #     'completion_ids': [[1,2,3,4], [5,6,7,8,9]],
+                    #     'completion_texts': ['This is a test.', 'This is another test.']
+                    # }
+                    
+                    all_completion_ids = all_outputs['completion_ids']
+                    all_completion_texts = all_outputs['completion_texts']
+                    
+                else:
+                    all_completion_ids = [None] * len(all_prompts_text)
+                    all_completion_texts = [None] * len(all_prompts_text)
                 
-            #     # vllm generate
-            #     if mode == 'train':
-            #         sampling_params = self.sampling_params
-            #         num_generations = self.num_generations
-            #     else:       # eval mode
-            #         sampling_params = self.eval_sampling_params
-            #         num_generations = self.num_eval_generations
+                # # Broadcast the completions from the main process to all processes, 
+                # # ensuring each process receives its corresponding slice.
+                # completion_ids = broadcast_object_list(completion_ids, from_process=0)
+                # process_slice = slice(
+                #     self.accelerator.process_index * len(prompts),
+                #     (self.accelerator.process_index + 1) * len(prompts),
+                # )
+                # completion_ids = completion_ids[process_slice]
 
-            #     ordered_set_of_prompts = all_prompts_text[::num_generations]
-            #     all_outputs = self.llm.generate(
-            #         ordered_set_of_prompts, 
-            #         sampling_params=sampling_params, 
-            #         use_tqdm=False
-            #     )
+                # Broadcast the completions from the main process to all processes, 
+                # ensuring each process receives its corresponding slice.
+                all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
+                all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
+                
+                # Keep only the local part of the data
+                start = self.accelerator.process_index * len(prompts)
+                completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
+                completion_texts = all_completion_texts[start:start+len(prompts)]
 
-            #     all_completion_ids = []
-            #     all_completion_texts = []
-            #     for outputs in all_outputs:
-            #         for output in outputs.outputs:
-            #             all_completion_ids.append(output.token_ids)
-            #             all_completion_texts.append(output.text)
 
-            # else:
-            #     all_completion_ids = [None] * len(all_prompts_text)
-            #     all_completion_texts = [None] * len(all_prompts_text)
+                # # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+                # all_prompts_text = gather_object(prompts_text)
+                # if self.accelerator.is_main_process:
+                #     # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                #     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                #     # prompt individually.
+                    
+                #     # vllm generate
+                #     if mode == 'train':
+                #         sampling_params = self.sampling_params
+                #         num_generations = self.num_generations
+                #     else:       # eval mode
+                #         sampling_params = self.eval_sampling_params
+                #         num_generations = self.num_eval_generations
+
+                #     ordered_set_of_prompts = all_prompts_text[::num_generations]
+                #     all_outputs = self.llm.generate(
+                #         ordered_set_of_prompts, 
+                #         sampling_params=sampling_params, 
+                #         use_tqdm=False
+                #     )
+
+                #     all_completion_ids = []
+                #     all_completion_texts = []
+                #     for outputs in all_outputs:
+                #         for output in outputs.outputs:
+                #             all_completion_ids.append(output.token_ids)
+                #             all_completion_texts.append(output.text)
+
+                # else:
+                #     all_completion_ids = [None] * len(all_prompts_text)
+                #     all_completion_texts = [None] * len(all_prompts_text)
+                
+                # # Broadcast the completions from the main process to all processes, 
+                # # ensuring each process receives its corresponding slice.
+                # all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
+                # all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
+                
+                # # Keep only the local part of the data
+                # start = self.accelerator.process_index * len(prompts)
+                # completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
+                # completion_texts = all_completion_texts[start:start+len(prompts)]
+                
+
+
+            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+            elif self.vllm_mode == "colocate":
+                # TODO: move to the last level
+                # vllm generate
+                if mode == 'train':
+                    sampling_params = self.sampling_params
+                    num_generations = self.num_generations
+                else:       # eval mode
+                    sampling_params = self.eval_sampling_params
+                    num_generations = self.num_eval_generations
+                
+                # all_prompts_text = prompts_text
+                if self.vllm_tensor_parallel_size > 1:
+                    # Gather prompts from all ranks in the TP group and flatten.
+                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
+                    orig_size = len(prompts_text)
+                    gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
+                    torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
+                    all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
+                else:
+                    all_prompts_text = prompts_text
+
+
+                all_outputs = self.llm.generate(
+                    all_prompts_text, 
+                    sampling_params=sampling_params, 
+                    use_tqdm=False
+                )
+
+                completion_ids = []
+                completion_texts = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
+                        completion_texts.append(output.text)
             
-            # # Broadcast the completions from the main process to all processes, 
-            # # ensuring each process receives its corresponding slice.
-            # all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
-            # all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
-            
-            # # Keep only the local part of the data
-            # start = self.accelerator.process_index * len(prompts)
-            # completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
-            # completion_texts = all_completion_texts[start:start+len(prompts)]
-            
-            if self.vllm_tensor_parallel_size > 1:
-                # Slice completions for this rank within its TP group.
-                # Each rank generates all outputs — we keep only our share.
-                local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
-                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
-                completion_ids = completion_ids[tp_slice]
-            
+                
+                if self.vllm_tensor_parallel_size > 1:
+                    # Slice completions for this rank within its TP group.
+                    # Each rank generates all outputs — we keep only our share.
+                    local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+                    tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                    completion_ids = completion_ids[tp_slice]
+                
             # Pad the completions
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
