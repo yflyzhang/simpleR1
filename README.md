@@ -28,18 +28,23 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ```
 ├── configs/
 │   ├── accelerate_configs/    # Deepspeed configs
+│   │   ├── ddp.yamal          # Distributed Data Parallel (DDP) config
 │   │   ├── zero2.yamal        # Deepspeed zero2 config
 │   │   └── ...                
 │   └── grpo_template.yaml     # Template for specifying arguments
 │       └── ...     
 │           
 ├── scripts/                   # Bash scripts to run
-│   ├── run_grpo_qwen2.5-1.5b-single.sh   # Shell for running Qwen2.5-1.5B with a single gpu
-│   ├── run_grpo_qwen3-0.6b-single.sh     # Shell for running Qwen3-0.6B with a single gpu
+│   ├── run_vllm_serve_3b.sh   # Run a vllm server for 3b model
+│   ├── train_grpo_3b.sh       # Train a grpo 3b model
+│   ├── run_vllm_serve_1.7b.sh   # Run a vllm server for 1.7b model
+│   ├── train_grpo_1.7b.sh       # Train a grpo 1.7b model
 │   └── ...         
 │           
 ├── src/                       # Python codes
 │   ├── arguments.py           # Model, scripts, and training arguments
+│   ├── vllm_serve.py          # vllm server (called by `run_vllm_serve*.sh`)
+│   ├── vllm_client.py         # vllm client (called by `grpo_trainer.py`)
 │   ├── rewards.py             # Reward functions
 │   ├── grpo_trainer.py        # Trainer for GRPO [core part]
 │   ├── run_grpo.py            # Python scripts to run GRPO
@@ -165,9 +170,9 @@ Below is an response example from trained `Qwen2.5-1.5B` on a MATH-500 problem:
 
 
 
+## Issues
+- Extracting and comparing the answers are not easy. For example, when the ground truth is $\boxed{\pi}$, while the model outputs `pi` or `π`, the accuracy should be 1, but the current implementation didn't consider them as equal.
 
-## Insights
-- [x] TODO
 
 ## 🚀 Usage
 
@@ -180,88 +185,114 @@ cd simpleR1
 
 2. Example training command:
 
-```bash
-bash scripts/run_grpo_qwen2.5-1.5b-single.sh
-```
 
-> [!NOTE]
-> `run_grpo_qwen2.5-1.5b-single.sh` provides a concrete runing example using only one A100-80G GPU, please change the parameters therein accordingly.
+    For multi-device training:
 
-Or override additional parameters via command line. For example,
+    Step 1: start the vllm server for generating samples
+    ```bash
+    bash scripts/run_vllm_serve_3b.sh
+    ```
 
-```bash
-# HF_HOME=/xxx/xxx/.cache/huggingface \
-CUDA_VISIBLE_DEVICES=0,1,2 \  # assume we have 3 gpus
-accelerate launch \
-    --main_process_port $MASTER_PORT \
-    --config_file configs/accelerate_configs/ddp.yaml \
-    --num_processes=2 \       # cuda:2 is reserved for vllm generation
-src/run_grpo.py \
-    --config configs/grpo_template.yaml \
-    --output_dir $OUTPUT_DIR \
-    --model_name_or_path $model_name_or_path \
-    --train_dataset_name $train_dataset \
-    --eval_dataset_name $eval_dataset \
-    --use_vllm True \
-    --vllm_gpu_memory_utilization 0.2 \
-    --num_train_epochs 1 \
-    --num_generations 7 \
-    --num_eval_generations 1 \
-    --per_device_train_batch_size 7 \
-    --per_device_eval_batch_size 64 \
-    --max_resample_attempts 3 \
-    --gradient_accumulation_steps 3 \
-    --num_iterations 3 \
-    --torch_empty_cache_steps 1 \
-    --max_num_train_samples 1000 \  # restrict max train/test samples for fast test
-    --max_num_test_samples -1 \
-    --max_completion_length 2048 \
-    --max_eval_completion_length 4096 \
-    --reward_funcs accuracy format tag \
-    --reward_weights 8 1 1 \
-    --loss_type bnpo \
-    --scale_rewards False \
-    --mask_truncated_completions True \
-    --epsilon 0.2 \
-    --epsilon_high 0.3 \
-    --temperature 1.0 \
-    --top_p 0.95 \
-    --eval_temperature 0.7 \    # eval rollout hyperparameter
-    --eval_top_p 0.95 \
-    --beta 0.0001 \
-    --compute_kl True \
-    --learning_rate 3e-6 \
-    --save_strategy steps \
-    --save_steps 100 \
-    --eval_strategy steps \
-    --eval_steps 10 \
-    --eval_on_start True \
-    --log_level info \
-    --wandb_project simpleR1-$(basename $train_dataset) \
-    --run_name $run_name \
-    2>&1 | tee $LOG_FILE
-```
+    > Or override additional parameters via command line. For example,
+    >  ```bash
+    >  # export HF_HOME=/xxx/xxx/.cache/huggingface
+    >  export CUDA_VISIBLE_DEVICES=2,3
+    >  python src/vllm_serve.py \
+    >      --model Qwen/Qwen2.5-3B \
+    >      --gpu_memory_utilization 0.9 \
+    >      --tensor_parallel_size 2 \
+    >      --data_parallel_size 1 \
+    >      --host 0.0.0.0 \
+    >      --port 8000
+    >  ```
 
 
+    Step 2: start the training pipeline while interacting with the vllm server
+    ```bash
+    bash scripts/train_grpo_3b.sh
+    ```
+
+    > Or override additional parameters via command line. For example,
+    > ```bash
+    > # export HF_HOME=/xxx/xxx/.cache/huggingface
+    > export CUDA_VISIBLE_DEVICES=0,1
+    > accelerate launch \
+    >     --main_process_port $MASTER_PORT \
+    >     --config_file configs/accelerate_configs/zero2.yaml \
+    >     --num_processes=2 \
+    > src/run_grpo.py \
+    >     --config configs/grpo_config.yaml \
+    >     --output_dir $OUTPUT_DIR \
+    >     --model_name_or_path $model_name_or_path \
+    >     --train_dataset_name $train_dataset \
+    >     --eval_dataset_name $eval_dataset \
+    >     --num_train_epochs 1 \
+    >     --num_generations 10 \
+    >     --num_eval_generations 1 \
+    >     --per_device_train_batch_size 5 \
+    >     --per_device_eval_batch_size 64 \
+    >     --max_resample_attempts 3 \
+    >     --gradient_accumulation_steps 3 \
+    >     --num_iterations 3 \
+    >     --torch_empty_cache_steps 1 \
+    >     --max_num_train_samples 2000 \
+    >     --max_num_test_samples -1 \
+    >     --max_completion_length 3072 \
+    >     --max_eval_completion_length 4096 \
+    >     --use_vllm True \
+    >     --vllm_gpu_memory_utilization 0.25 \
+    >     --vllm_mode server \
+    >     --vllm_server_host 0.0.0.0 \
+    >     --vllm_server_port 8001 \
+    >     --reward_funcs accuracy format tag \
+    >     --reward_weights 8 1 1 \
+    >     --loss_type bnpo \
+    >     --scale_rewards False \
+    >     --mask_truncated_completions True \
+    >     --epsilon 0.2 \
+    >     --epsilon_high 0.3 \
+    >     --temperature 1.0 \
+    >     --top_p 0.95 \
+    >     --eval_temperature 0.7 \
+    >     --eval_top_p 0.95 \
+    >     --beta 0.0001 \
+    >     --compute_kl True \
+    >     --lr_scheduler_type constant \
+    >     --learning_rate 3e-6 \
+    >     --save_strategy steps \
+    >     --save_steps 100 \
+    >     --eval_strategy steps \
+    >     --eval_steps 10 \
+    >     --eval_on_start True \
+    >     --log_level info \
+    >     --wandb_project simpleR1-$(basename $train_dataset) \
+    >     --run_name $run_name \
+    >     2>&1 | tee $LOG_FILE
+    > ```
+
+    > [!NOTE]
+    > `run_vllm_serve_3b.sh` and `train_grpo_3b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
+
+    
 ## Dependencies
 See `requirements.txt` for a full list, but generally you don't need to install all of them. <br>
 Key dependencies include and can be installed as follows:
 
 ```bash
 # 1. Create and activate a new env named `simpler1`
-conda create --prefix simpler1 python==3.12
+conda create --prefix simpler1 python==3.10
 # Activate the env, for example:
 conda activate /path/simpler1
 
 # 2. Install the key dependencies
 # CUDA 12.4
-conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.4 -c pytorch -c nvidia
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-pip install transformers==4.51.0 accelerate==1.4.0 trl==0.16.0 deepspeed==0.16.4
+pip install transformers==4.52.4 accelerate==1.7.0 trl==0.18.2 deepspeed==0.16.9
 pip install flash-attn --no-build-isolation
-pip install vllm==0.7.2
-pip install math-verify==0.5.2 latex2sympy2_extended==1.0.6
-pip install wandb==0.19.7
+pip install vllm==0.8.5.post1
+pip install math-verify==0.7.0 latex2sympy2_extended==1.10.1
+pip install wandb==0.20.1
 ```
 
 
