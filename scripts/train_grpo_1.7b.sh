@@ -12,6 +12,7 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
+model_name_or_path=Qwen/Qwen3-1.7B
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -74,24 +75,24 @@ src/run_grpo.py \
     --model_name_or_path $model_name_or_path \
     --train_dataset_name $train_dataset \
     --eval_dataset_name $eval_dataset \
-    --use_vllm True \
-    --vllm_gpu_memory_utilization 0.25 \
     --num_train_epochs 1 \
-    --num_generations 14 \
+    --num_generations 10 \
     --num_eval_generations 1 \
-    --vllm_mode server \
-    --vllm_server_host 0.0.0.0 \
-    --vllm_server_port 8000 \
-    --per_device_train_batch_size 7 \
-    --per_device_eval_batch_size 64 \
+    --per_device_train_batch_size 5 \
+    --per_device_eval_batch_size 128 \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 3 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 2000 \
     --max_num_test_samples -1 \
-    --max_completion_length 2048 \
-    --max_eval_completion_length 4096 \
+    --max_completion_length 4096 \
+    --max_eval_completion_length 8092 \
+    --use_vllm True \
+    --vllm_gpu_memory_utilization 0.25 \
+    --vllm_mode server \
+    --vllm_server_host 0.0.0.0 \
+    --vllm_server_port 8000 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --loss_type bnpo \
