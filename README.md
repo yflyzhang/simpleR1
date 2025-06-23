@@ -35,10 +35,12 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 │       └── ...     
 │           
 ├── scripts/                   # Bash scripts to run
+│   ├── train_grpo_1.5b-single.sh # Train a 1.5b model with a single gpu
+│   ├── train_grpo_3b-single.sh   # Train a 3b model with a single gpu
 │   ├── run_vllm_serve_3b.sh   # Run a vllm server for 3b model
 │   ├── train_grpo_3b.sh       # Train a grpo 3b model
-│   ├── run_vllm_serve_1.7b.sh   # Run a vllm server for 1.7b model
-│   ├── train_grpo_1.7b.sh       # Train a grpo 1.7b model
+│   ├── run_vllm_serve_1.7b.sh # Run a vllm server for 1.7b model
+│   ├── train_grpo_1.7b.sh     # Train a grpo 1.7b model
 │   └── ...         
 │           
 ├── src/                       # Python codes
@@ -170,49 +172,120 @@ Below is an response example from trained `Qwen2.5-1.5B` on a MATH-500 problem:
 
 
 
-## Issues
-- Extracting and comparing the answers are not easy. For example, when the ground truth is $\boxed{\pi}$, while the model outputs `pi` or `π`, the accuracy should be 1, but the current implementation didn't consider them as equal.
-
 
 ## 🚀 Usage
 
-1. Clone the repository:
+#### Clone the repository:
 ```bash
 git clone https://github.com/yflyzhang/simpleR1.git
 cd simpleR1
 ```
 
 
-2. Example training command:
+#### Example training command:
+
+1. For single-device training:
+
+    > Make sure `vllm_mode = colocate`.
+    ```bash
+    bash scripts/train_grpo_1.5b-single.sh
+    ```
+    
+
+    > Or override additional parameters via command line. 
+    > For example,
+    > ```bash
+    > model_name_or_path=Qwen/Qwen2.5-1.5B
+    > train_dataset=nlile/hendrycks-MATH-benchmark
+    > eval_dataset=HuggingFaceH4/MATH-500
+    > # export HF_HOME=/xxx/xxx/.cache/huggingface
+    > export CUDA_VISIBLE_DEVICES=0
+    > accelerate launch \
+    >     --main_process_port $MASTER_PORT \
+    >     --config_file configs/accelerate_configs/ddp.yaml \
+    >     --num_processes=1 \
+    > src/run_grpo.py \
+    >     --config configs/grpo_config.yaml \
+    >     --output_dir $OUTPUT_DIR \
+    >     --check_gpu_idle True \
+    >     --model_name_or_path $model_name_or_path \
+    >     --train_dataset_name $train_dataset \
+    >     --eval_dataset_name $eval_dataset \
+    >     --use_vllm True \
+    >     --vllm_mode colocate \
+    >     --vllm_gpu_memory_utilization 0.2 \
+    >     --num_train_epochs 1 \
+    >     --num_generations 7 \
+    >     --num_eval_generations 1 \
+    >     --per_device_train_batch_size 7 \
+    >     --per_device_eval_batch_size 64 \
+    >     --max_resample_attempts 3 \
+    >     --gradient_accumulation_steps 3 \
+    >     --num_iterations 3 \
+    >     --torch_empty_cache_steps 1 \
+    >     --max_num_train_samples 2000 \
+    >     --max_num_test_samples -1 \
+    >     --max_completion_length 2048 \
+    >     --max_eval_completion_length 4096 \
+    >     --reward_funcs accuracy format tag \
+    >     --reward_weights 8 1 1 \
+    >     --loss_type bnpo \
+    >     --scale_rewards False \
+    >     --mask_truncated_completions True \
+    >     --epsilon 0.2 \
+    >     --epsilon_high 0.3 \
+    >     --temperature 1.0 \
+    >     --top_p 0.95 \
+    >     --eval_temperature 0.7 \
+    >     --eval_top_p 0.95 \
+    >     --beta 0.0001 \
+    >     --compute_kl True \
+    >     --lr_scheduler_type constant \
+    >     --learning_rate 3e-6 \
+    >     --save_strategy steps \
+    >     --save_steps 100 \
+    >     --eval_strategy steps \
+    >     --eval_steps 10 \
+    >     --eval_on_start True \
+    >     --log_level info \
+    >     --wandb_project simpleR1-$(basename $train_dataset) \
+    >     --run_name $model_name_or_path \
+    >     2>&1 | tee train.log
+    >  ```
 
 
-    For multi-device training:
 
-    Step 1: start the vllm server for generating samples
+2. For multi-device training:
+
+    Step 1: Start the vllm server for generating samples
     ```bash
     bash scripts/run_vllm_serve_3b.sh
     ```
 
     > Or override additional parameters via command line. For example,
-    >  ```bash
-    >  # export HF_HOME=/xxx/xxx/.cache/huggingface
-    >  export CUDA_VISIBLE_DEVICES=2,3
-    >  python src/vllm_serve.py \
-    >      --model Qwen/Qwen2.5-3B \
-    >      --gpu_memory_utilization 0.9 \
-    >      --tensor_parallel_size 2 \
-    >      --data_parallel_size 1 \
-    >      --host 0.0.0.0 \
-    >      --port 8000
+    > ```bash
+    > # export HF_HOME=/xxx/xxx/.cache/huggingface
+    > export CUDA_VISIBLE_DEVICES=2,3
+    > python src/vllm_serve.py \
+    >     --model Qwen/Qwen2.5-3B \
+    >     --gpu_memory_utilization 0.9 \
+    >     --tensor_parallel_size 2 \
+    >     --data_parallel_size 1 \
+    >     --host 0.0.0.0 \
+    >     --port 8000
     >  ```
+    
+    
+    Step 2: Start the training pipeline while interacting with the vllm server
 
+    > Make sure `vllm_mode = server`.
 
-    Step 2: start the training pipeline while interacting with the vllm server
     ```bash
     bash scripts/train_grpo_3b.sh
     ```
 
     > Or override additional parameters via command line. For example,
+    > > Make sure the setting of `vllm_server_port` is consistent with the vllm_serve port in step 1.
     > ```bash
     > # export HF_HOME=/xxx/xxx/.cache/huggingface
     > export CUDA_VISIBLE_DEVICES=0,1
@@ -223,7 +296,7 @@ cd simpleR1
     > src/run_grpo.py \
     >     --config configs/grpo_config.yaml \
     >     --output_dir $OUTPUT_DIR \
-    >     --model_name_or_path $model_name_or_path \
+    >     --model_name_or_path Qwen/Qwen2.5-3B \
     >     --train_dataset_name $train_dataset \
     >     --eval_dataset_name $eval_dataset \
     >     --num_train_epochs 1 \
@@ -243,7 +316,7 @@ cd simpleR1
     >     --vllm_gpu_memory_utilization 0.25 \
     >     --vllm_mode server \
     >     --vllm_server_host 0.0.0.0 \
-    >     --vllm_server_port 8001 \
+    >     --vllm_server_port 8000 \
     >     --reward_funcs accuracy format tag \
     >     --reward_weights 8 1 1 \
     >     --loss_type bnpo \
@@ -269,9 +342,10 @@ cd simpleR1
     >     --run_name $run_name \
     >     2>&1 | tee $LOG_FILE
     > ```
+  
 
-    > [!NOTE]
-    > `run_vllm_serve_3b.sh` and `train_grpo_3b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
+  > [!NOTE]
+  > `run_vllm_serve_3b.sh` and `train_grpo_3b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
 
     
 ## Dependencies
@@ -294,6 +368,11 @@ pip install vllm==0.8.5.post1
 pip install math-verify==0.7.0 latex2sympy2_extended==1.10.1
 pip install wandb==0.20.1
 ```
+
+
+## Issues
+- Extracting and comparing the answers are not easy. <br>
+  For example, when the ground truth is `\boxed{\pi}` and the model outputs `pi` or `π`, the accuracy should be 1, but the current implementation (mainly due to `math-verify`) didn't consider them as equal.
 
 
 ## Contributing
