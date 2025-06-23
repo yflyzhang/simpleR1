@@ -16,7 +16,6 @@
 # Modifications are licensed under the Apache License, Version 2.0.
 
 
-
 import contextlib
 import functools
 import os
@@ -394,8 +393,8 @@ class GRPOTrainer(Trainer):
         
         self.use_vllm = args.use_vllm
         self.vllm_mode = args.vllm_mode
-        self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
-        self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
+        self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization     # only applies to colocation mode
+        self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size         # only applies to colocation mode
         
         # Multi-step
         self.num_iterations = args.num_iterations   # = 𝜇 in the GRPO paper
@@ -538,19 +537,6 @@ class GRPOTrainer(Trainer):
                     # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     # max_num_batched_tokens=4096,
                 )
-                
-                # self.llm = LLM(
-                #     model=model.name_or_path,
-                #     device=vllm_device,
-                #     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                #     # dtype=self.args.vllm_dtype,
-                #     # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                #     # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                #     # This is particularly useful here because we generate completions from the same prompts.
-                #     enable_prefix_caching=self.args.vllm_enable_prefix_caching,
-                #     max_model_len=self.args.vllm_max_model_len,
-                # )
-            
             
             # Guided decoding, if enabled
             if args.vllm_guided_decoding_regex is not None:
@@ -570,17 +556,6 @@ class GRPOTrainer(Trainer):
                 repetition_penalty=args.repetition_penalty,
                 guided_decoding=guided_decoding,
             )
-
-            # sampling_params = SamplingParams(
-            #     n=1,  # vLLM on each GPU generates only 1 in colocate mode
-            #     repetition_penalty=self.repetition_penalty,
-            #     temperature=self.temperature,
-            #     top_p=self.top_p,
-            #     top_k=-1 if self.top_k is None else self.top_k,
-            #     min_p=0.0 if self.min_p is None else self.min_p,
-            #     max_tokens=self.max_completion_length,
-            #     guided_decoding=guided_decoding,
-            # )
             
             # Sampling parameters for evaluation
             self.eval_sampling_params = SamplingParams(
@@ -714,9 +689,7 @@ class GRPOTrainer(Trainer):
     
     def _move_model_to_vllm(self):
         r"""Load model state dict to vllm"""
-
-        from contextlib import nullcontext
-        logger.warning(f"[rank={self.accelerator.process_index}] Moving model to vllm")
+        # logger.debug(f"[rank={self.accelerator.process_index}] Moving model to vllm")
         
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
@@ -726,7 +699,7 @@ class GRPOTrainer(Trainer):
 
             gather_if_zero3 = deepspeed.zero.GatheredParameters
         else:
-            gather_if_zero3 = nullcontext
+            gather_if_zero3 = contextlib.nullcontext
         
         if is_peft_model(self.model):
             # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
@@ -749,66 +722,6 @@ class GRPOTrainer(Trainer):
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
         
-    
-    # def _move_model_to_vllm(self):
-    #     r"""Load model state dict to vllm"""
-    #     logger.warning(f"[rank={self.accelerator.process_index}] Moving model to vllm")
-
-    #     with unwrap_model_for_generation(
-    #         self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
-    #     ) as unwrapped_model:
-    #         if is_compiled_module(unwrapped_model):
-    #             unwrapped_model = unwrapped_model._orig_mod
-    #         if is_peft_model(unwrapped_model):
-    #             unwrapped_model.merge_adapter()
-    #             state_dict = unwrapped_model.state_dict()
-    #             # Remove base_model and base_layer prefixes
-    #             state_dict = {
-    #                 k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()
-    #             }
-    #             # Remove values with adapter prefix (example: "_lora")
-    #             state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
-    #             # When module to save, remove its prefix and discard the original module
-    #             state_dict = {
-    #                 k.replace("modules_to_save.default.", ""): v
-    #                 for k, v in state_dict.items()
-    #                 if "original_module" not in k
-    #             }
-    #         else:
-    #             state_dict = unwrapped_model.state_dict()
-
-    #         if self.accelerator.is_main_process:
-    #             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-    #             llm_model.load_weights(state_dict.items())
-    #         # Unmerge the adapter to restore the model to its original state.
-    #         # This must be done after loading weights to ensure they correspond to the merged state.
-    #         if is_peft_model(unwrapped_model):
-    #             unwrapped_model.unmerge_adapter()
-            
-            
-
-            # # >>>>> add a breakpoint for debug? <<<<<
-            # logger.info("[_move_model_to_vllm] state_dict keys: {}".format(state_dict.keys()))
-            # torch.distributed.breakpoint(rank=0)
-            
-
-            # # torch.testing.assert_close(actual, expected)
-            # torch.testing.assert_close(state_dict, llm_model.state_dict())
-
-            # keys1 = set(state_dict.keys())
-            # keys2 = set(llm_model.state_dict().keys())
-            
-            # len(keys1), len(keys2)
-            # len(keys1 - keys2)
-            # len(keys2 - keys1)
-            
-            # sorted(keys1 - keys2)
-            # sorted(keys2 - keys1)
-            
-            # {k:v.shape for k,v in state_dict.items() if len(v) < 1}
-
-            # sorted(list(keys1))
-            # sorted(list(keys2))[:10]
             
     
     def get_train_dataloader(self) -> DataLoader:
@@ -938,18 +851,21 @@ class GRPOTrainer(Trainer):
         
         # Check rewards
         rewards = inputs['rewards'].tolist()
-        # 1. full rewards (good and meets criterion?)
+        # 1. full rewards (all rewards)
         # Note: the current question is too easy for the model as it can get full rewrds for all generations.
         if min(rewards) == sum(self.reward_weights.tolist()):
-            return True
+            return False
+        
+        # # If no generation get the full reward, try it again.
+        # if max(rewards) < sum(self.reward_weights.tolist()):   
+        #     return False
         
         # 2. accuracy reward (primary reward)
         # If no generation arrives at the right answer, try it again.
-        # if max(rewards) != sum(self.reward_weights.tolist()):
         if max(rewards) < max(self.reward_weights.tolist()):    
             return False
         
-        # 3. identical rewards: std=0 (e.g., all zeros, or all format rewards)
+        # 3. identical rewards: std=0 (e.g., all format rewards)
         if len(set(rewards)) == 1:
             return False
         
@@ -1077,27 +993,16 @@ class GRPOTrainer(Trainer):
                     if mode == 'train':
                         sampling_params = self.sampling_params
                         num_generations = self.num_generations
-                        max_tokens = self.max_completion_length
                     else:       # eval mode
                         sampling_params = self.eval_sampling_params
                         num_generations = self.num_eval_generations
-                        max_tokens = self.max_eval_completion_length
                     
-                    # ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
                     ordered_set_of_prompts = all_prompts_text[::num_generations]
-                    
-                    # all_outputs = self.llm.generate(
-                    #     ordered_set_of_prompts, 
-                    #     sampling_params=sampling_params, 
-                    #     use_tqdm=False
-                    # )
-                    
-                    # with profiling_context(self, "vLLM.generate"):
-                    # TODO: Replace the configurations with samling params in vllm_client.generate?
                     all_outputs = self.vllm_client.generate(
                         prompts=ordered_set_of_prompts,
                         sampling_params=sampling_params
                     )
+                    # Example output:
                     # all_outputs = {
                     #     'completion_ids': [[1,2,3,4], [5,6,7,8,9]],
                     #     'completion_texts': ['This is a test.', 'This is another test.']
@@ -1110,15 +1015,6 @@ class GRPOTrainer(Trainer):
                     all_completion_ids = [None] * len(all_prompts_text)
                     all_completion_texts = [None] * len(all_prompts_text)
                 
-                # # Broadcast the completions from the main process to all processes, 
-                # # ensuring each process receives its corresponding slice.
-                # completion_ids = broadcast_object_list(completion_ids, from_process=0)
-                # process_slice = slice(
-                #     self.accelerator.process_index * len(prompts),
-                #     (self.accelerator.process_index + 1) * len(prompts),
-                # )
-                # completion_ids = completion_ids[process_slice]
-
                 # Broadcast the completions from the main process to all processes, 
                 # ensuring each process receives its corresponding slice.
                 all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
@@ -1130,63 +1026,14 @@ class GRPOTrainer(Trainer):
                 completion_texts = all_completion_texts[start:start+len(prompts)]
 
 
-                # # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-                # all_prompts_text = gather_object(prompts_text)
-                # if self.accelerator.is_main_process:
-                #     # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                #     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                #     # prompt individually.
-                    
-                #     # vllm generate
-                #     if mode == 'train':
-                #         sampling_params = self.sampling_params
-                #         num_generations = self.num_generations
-                #     else:       # eval mode
-                #         sampling_params = self.eval_sampling_params
-                #         num_generations = self.num_eval_generations
-
-                #     ordered_set_of_prompts = all_prompts_text[::num_generations]
-                #     all_outputs = self.llm.generate(
-                #         ordered_set_of_prompts, 
-                #         sampling_params=sampling_params, 
-                #         use_tqdm=False
-                #     )
-
-                #     all_completion_ids = []
-                #     all_completion_texts = []
-                #     for outputs in all_outputs:
-                #         for output in outputs.outputs:
-                #             all_completion_ids.append(output.token_ids)
-                #             all_completion_texts.append(output.text)
-
-                # else:
-                #     all_completion_ids = [None] * len(all_prompts_text)
-                #     all_completion_texts = [None] * len(all_prompts_text)
-                
-                # # Broadcast the completions from the main process to all processes, 
-                # # ensuring each process receives its corresponding slice.
-                # all_completion_ids = broadcast_object_list(all_completion_ids, from_process=0)
-                # all_completion_texts = broadcast_object_list(all_completion_texts, from_process=0)
-                
-                # # Keep only the local part of the data
-                # start = self.accelerator.process_index * len(prompts)
-                # completion_ids = all_completion_ids[start:start+len(prompts)]   # [i:i+len(prompts)]
-                # completion_texts = all_completion_texts[start:start+len(prompts)]
-                
-
-
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
             elif self.vllm_mode == "colocate":
-                # TODO: move to the last level
                 # vllm generate
                 if mode == 'train':
                     sampling_params = self.sampling_params
-                    num_generations = self.num_generations
                 else:       # eval mode
                     sampling_params = self.eval_sampling_params
-                    num_generations = self.num_eval_generations
                 
-                # all_prompts_text = prompts_text
                 if self.vllm_tensor_parallel_size > 1:
                     # Gather prompts from all ranks in the TP group and flatten.
                     # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
@@ -1196,21 +1043,22 @@ class GRPOTrainer(Trainer):
                     all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
                 else:
                     all_prompts_text = prompts_text
-
-
+                
+                # Each process generates its own completions given the prompts
                 all_outputs = self.llm.generate(
                     all_prompts_text, 
                     sampling_params=sampling_params, 
                     use_tqdm=False
                 )
-
+                
+                # Each process receives its corresponding slice
                 completion_ids = []
                 completion_texts = []
                 for outputs in all_outputs:
                     for output in outputs.outputs:
                         completion_ids.append(output.token_ids)
                         completion_texts.append(output.text)
-            
+                
                 
                 if self.vllm_tensor_parallel_size > 1:
                     # Slice completions for this rank within its TP group.
@@ -1686,6 +1534,7 @@ class GRPOTrainer(Trainer):
         
         # Token-level loss:
         elif self.loss_type == "bnpo":
+            # Normalization is performed over the local batch only.
             # Longer sequences can have more influence on the overall gradient update, but 
             # particular generation pattern may help to train the model regardless of the response length.
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)

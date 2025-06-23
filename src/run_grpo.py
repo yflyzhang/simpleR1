@@ -301,6 +301,14 @@ def main():
     
     # # >>>>> add a breakpoint for debug? <<<<<
     # torch.distributed.breakpoint(rank=0)
+    
+    try:
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+    except Exception as e:
+        logger.warning(f"Failed to destroy process group: {e}.")
+
 
 if __name__ == "__main__":
     main()

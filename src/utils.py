@@ -210,6 +210,24 @@ def check_gpu_free(gpu_memory_threshold=10000, gpu_util_threshold=10):
         return False
 
 
+
+
+######################
+# Get open port
+######################
+import socket
+def _get_open_port(port) -> int:
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", port))
+                print(f"Port is set as {port}")
+                return port
+        except OSError:
+            port += 1  # Increment port number if already in use
+            print(f"Port {port-1} is already in use, trying port {port}")
+
+
 ####################
 # Profiling context
 ####################

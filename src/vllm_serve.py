@@ -1,9 +1,10 @@
 import argparse
 import logging
 import os
+import json
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
@@ -45,7 +46,16 @@ if is_vllm_available():
         from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator
 
 
+# Setup logging
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    # format="[%(asctime)s] [%(levelname)s] [%(name)s]  %(message)s",
+    # format="[%(levelname)s|%(pathname)s:%(lineno)s] %(asctime)s >> %(message)s",
+    format="[%(levelname)s|%(filename)s:%(lineno)s] %(asctime)s >> %(message)s",
+    # format="[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d:%(funcName)s] %(message)s"
+    # datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
 
 # We use CUDA with multiprocessing, so we must use the 'spawn' start method. Otherwise, we will get the following
 # error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
@@ -253,6 +263,15 @@ class ScriptArguments:
         },
     )
 
+    
+    def to_json_string(self):
+        """
+        Serializes this instance to a JSON string.
+        """
+        d = {field.name: getattr(self, field.name) for field in fields(self) if field.init}
+        return json.dumps(d, indent=2)
+
+
 
 def llm_worker(
     script_args: ScriptArguments, data_parallel_rank: int, master_port: int, connection: Connection
@@ -318,6 +337,20 @@ def chunk_list(lst: list, n: int) -> list[list]:
     return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
 
 
+# Get the open port
+import socket
+def _get_open_port(port) -> int:
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", port))
+                logger.info(f"server_port is set as {port}")
+                return port
+        except OSError:
+            port += 1  # Increment port number if already in use
+            logger.warning(f"server_port {port-1} is already in use, trying port {port}")
+
+
 def main(script_args: ScriptArguments):
     if not is_fastapi_available():
         raise ImportError(
@@ -336,9 +369,10 @@ def main(script_args: ScriptArguments):
 
     if not is_vllm_available():
         raise ImportError("vLLM is required to run the vLLM serve script. Please install it using `pip install vllm`.")
-
+    
     # Spawn dp workers, and setup pipes for communication
     master_port = get_open_port()
+    logger.info(f"master_port = {master_port}")
     connections = []
     processes = []
     for data_parallel_rank in range(script_args.data_parallel_size):
@@ -559,9 +593,13 @@ def main(script_args: ScriptArguments):
         for connection in connections:
             connection.send({"type": "fire_and_forget", "method": "collective_rpc", "kwargs": kwargs})
         return {"message": "Request received, closing communicator"}
-
+    
     # Start the server
-    uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
+    # uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
+    # Adjust the port if it's already in use
+    # e.g., error while attempting to bind on address ('0.0.0.0', 8000): address already in use
+    port = _get_open_port(script_args.port)
+    uvicorn.run(app, host=script_args.host, port=port, log_level=script_args.log_level)
 
 
 def make_parser(subparsers: argparse._SubParsersAction = None):
@@ -575,4 +613,5 @@ def make_parser(subparsers: argparse._SubParsersAction = None):
 if __name__ == "__main__":
     parser = make_parser()
     (script_args,) = parser.parse_args_and_config()
+    logger.info(f"\nscript_args = {script_args.to_json_string()}")
     main(script_args)
