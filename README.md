@@ -285,7 +285,7 @@ cd simpleR1
     ```
 
     > Or override additional parameters via command line. For example,
-    > > Make sure the setting of `vllm_server_port` is consistent with the vllm_serve port in step 1.
+    > > Make sure the setting of `vllm_server_port` is consistent with the vllm_serve port in Step 1.
     > ```bash
     > # export HF_HOME=/xxx/xxx/.cache/huggingface
     > export CUDA_VISIBLE_DEVICES=0,1
@@ -363,7 +363,7 @@ conda activate /path/simpler1
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 pip install transformers==4.52.4 accelerate==1.7.0 trl==0.18.2 deepspeed==0.16.9
-pip install flash-attn --no-build-isolation
+pip install flash-attn==2.7.4.post1
 pip install vllm==0.8.5.post1
 pip install math-verify==0.7.0 latex2sympy2_extended==1.10.1
 pip install wandb==0.20.1
