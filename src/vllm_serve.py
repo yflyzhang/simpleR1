@@ -467,13 +467,7 @@ def main(script_args: ScriptArguments):
         {"completion_ids": [[101, 102, 103], [201, 202, 203]]}
         ```
         """
-
-        # # Guided decoding, if enabled
-        # if request.guided_decoding_regex is not None:
-        #     guided_decoding = GuidedDecodingParams(backend="outlines", regex=request.guided_decoding_regex)
-        # else:
-        #     guided_decoding = None
-
+        
         # Sampling parameters
         sampling_params = SamplingParams(
             n=request.n,
@@ -596,7 +590,7 @@ def main(script_args: ScriptArguments):
     
     # Start the server
     # uvicorn.run(app, host=script_args.host, port=script_args.port, log_level=script_args.log_level)
-    # Adjust the port if it's already in use
+    # Adjust the port (`_get_open_port`) if it's already in use
     # e.g., error while attempting to bind on address ('0.0.0.0', 8000): address already in use
     port = _get_open_port(script_args.port)
     uvicorn.run(app, host=script_args.host, port=port, log_level=script_args.log_level)
