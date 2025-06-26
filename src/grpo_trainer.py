@@ -1904,9 +1904,13 @@ class GRPOTrainer(Trainer):
                 Additional keyword arguments used to hide deprecated arguments
         
         Ref: Trainer.train: 
+            https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/trainer.py#L2059
             https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L2139
 
         """
+        # TODO: dynamic sampling: 
+        # skip too simple, resample hard
+
         if resume_from_checkpoint is False:
             resume_from_checkpoint = None
 
