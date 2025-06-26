@@ -88,7 +88,6 @@ src/run_grpo.py \
     --max_completion_length 3072 \
     --max_eval_completion_length 4096 \
     --use_vllm True \
-    --vllm_gpu_memory_utilization 0.25 \
     --vllm_mode server \
     --vllm_server_host 0.0.0.0 \
     --vllm_server_port 8001 \
