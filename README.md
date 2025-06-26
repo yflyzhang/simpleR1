@@ -37,8 +37,10 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ├── scripts/                   # Bash scripts to run
 │   ├── train_grpo_1.5b-single.sh # Train a 1.5b model with a single gpu
 │   ├── train_grpo_3b-single.sh   # Train a 3b model with a single gpu
+│   │
 │   ├── run_vllm_serve_3b.sh   # Run a vllm server for 3b model
 │   ├── train_grpo_3b.sh       # Train a grpo 3b model
+│   │
 │   ├── run_vllm_serve_1.7b.sh # Run a vllm server for 1.7b model
 │   ├── train_grpo_1.7b.sh     # Train a grpo 1.7b model
 │   └── ...         
@@ -374,6 +376,9 @@ pip install wandb==0.20.1
 - Extracting and comparing the answers are not easy. <br>
   For example, when the ground truth is `\boxed{\pi}` and the model outputs `pi` or `π`, the accuracy should be 1, but the current implementation (mainly due to `math-verify`) didn't consider them as equal.
 
+## TODOs
+- LoRA is not supported yet.
+- The current implementation of resample is not efficient.
 
 ## Contributing
 
