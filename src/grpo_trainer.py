@@ -25,9 +25,6 @@ from collections import defaultdict
 from typing import Any, Callable, Optional, Sized, Union, Iterator
 from unittest.mock import patch
 
-
-import pandas as pd
-import gc
 # --------------------------------
 from transformers.trainer import *
 
@@ -35,6 +32,9 @@ from transformers.trainer import *
 from transformers.trainer import _is_peft_model
 # --------------------------------
 
+import gc
+import numpy as np
+import pandas as pd
 
 import torch
 from torch import nn
@@ -82,16 +82,18 @@ if is_vllm_available():
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import GuidedDecodingParams
 
+from tqdm import tqdm
 if is_wandb_available():
     import wandb
 
 
 
-from utils import is_messages, ProgressCallback
+from utils import is_messages
 from vllm_client import VLLMClient
 
-# Customed ProgressCallback
-DEFAULT_PROGRESS_CALLBACK = ProgressCallback
+# Custom ProgressCallback
+from callbacks import GRPOProgressCallback
+# DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -101,6 +103,8 @@ RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 def debug(rank=0):
     # Add a distributed breakpoint for debug for a specific rank
     torch.distributed.breakpoint(rank=rank)
+
+# breakpoint()
 
 
 class RepeatRandomSampler(Sampler):
@@ -462,6 +466,15 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
+        # Remove `transformers.trainer_callback.ProgressCallback`,
+        # and add custom `GRPOProgressCallback`
+        from transformers.trainer_callback import ProgressCallback
+        self.callback_handler.pop_callback(ProgressCallback)
+        self.callback_handler.add_callback(GRPOProgressCallback)
+        # self.callback_handler.callbacks
+        
+        # debug(0)
+        
         # Note: the log level (of logger) is set depending on the node. 
         # By default, the main process (rank 0) logs at level INFO, while other processes log at level WARNING.
         # For further details, see:
@@ -494,7 +507,7 @@ class GRPOTrainer(Trainer):
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
-
+        
         if self.use_vllm:
             if not is_vllm_available():
                 raise ImportError(
@@ -603,9 +616,7 @@ class GRPOTrainer(Trainer):
                 min_p=args.min_p,
                 repetition_penalty=args.repetition_penalty,
             )
-        
-        
-        # debug(0)
+
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -855,7 +866,7 @@ class GRPOTrainer(Trainer):
             return loss.detach()
     
 
-    def check_model_generation(self, rewards):
+    def check_model_generation(self, rewards, **kwargs):
         r"""
         Check if current generation meets specific criterion based on rewards.
         For example, make sure the generated sentences are diverse and contain positive samples.
@@ -873,12 +884,23 @@ class GRPOTrainer(Trainer):
                 "good": Current generations are diverse with at least one right answer.
         """
 
+        # TODO: if no dynamic sampling, simply return 'good'
+
         # 1. Easy: full rewards for all generations
         # Note: the current question is too easy for the model as it can get full rewrds for all generations.
         if min(rewards) == sum(self.reward_weights.tolist()):
             return 'easy'
         
-        # 2. Hard: accuracy reward (the primary reward)
+        # 2. Bad: Nearly identical rewards, e.g., std=0
+        # example: [10, 10, 10, 8]
+        # if np.std(rewards) == 0:
+        if np.std(rewards) < 1e-3:
+        # RSD = std / mean, RSD > 0.1 is good.
+        # TODO: change to other values or set by user
+        # if np.std(rewards) / (np.mean(rewards) + 1e-6) < 0.1:
+            return 'bad'
+        
+        # 3. Hard: accuracy reward (the primary reward)
         # If no generation arrives at the right answer, try it again.
         if max(rewards) < max(self.reward_weights.tolist()):    
             return 'hard'
@@ -886,81 +908,11 @@ class GRPOTrainer(Trainer):
         # if max(rewards) < sum(self.reward_weights.tolist()):   
         #     return 'hard
         
-        # 3. Bad: Identical rewards: std=0 (e.g., only format rewards)
-        if len(set(rewards)) == 1:
-            return 'bad'
-        
         # TODO: 
         # Check other conditions, e.g., generation diversity, entropy
         
         # 4. Good: All rewards are within a certain range (with at least one right answer)
         return 'good'
-    
-    
-    # def prepare_grpo_inputs(
-    #     self, 
-    #     inputs: list[str],
-    # ) -> dict[str, Union[torch.Tensor, Any]]:
-    #     r"""
-    #     Prepare grpo `inputs` before feeding them to the model
-        
-    #     Args:
-    #         inputs (`list[str]`):
-    #             List of input batched data.
-        
-    #     Return:
-    #         `dict[str, Union[torch.Tensor, Any]]`.
-        
-    #     Note:
-    #         In `eval` mode, it only calls `_generate_score_log_completions` which will generate, score and log the completions.
-    #         While in `train` mode, it further computes logits/logps for prompts and completions under ref model and old model.
-    #     """
-        
-    #     mode = self.mode
-    #     if not mode:
-    #         raise ValueError(f"`mode` should be specified clearly! It could be 'train' or 'eval'.")
-        
-    #     if mode == "train":     # train mode
-    #         # if self.state.global_step % self.num_iterations == 0:
-    #         if self.grpo_iteration == 0:
-    #             # Generate and score completions in grpo_iteration=0, and reuse them for later grpo iterations
-    #             # Rejection sampling for model generation
-    #             max_attempts = max(self.max_resample_attempts, 1) # maximum number of generation attempts
-    #             for attempt in range(1, max_attempts+1):
-    #                 grpo_inputs = self._generate_score_log_completions(inputs, attempt=attempt)
-
-    #                 # Check if current model generation meets specific criterion(s)
-    #                 if self.check_model_generation(grpo_inputs):
-    #                     # logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is good.")
-    #                     logger.info(f"\n  [attempt={attempt}]: Current model generation is good.")
-    #                     break
-    #                 elif attempt == max_attempts:
-    #                     logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
-    #                 else:
-    #                     logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, try again...")
-                
-    #             # Get per token logps (old_per_token_logps and ref_per_token_logps)
-    #             # Note: call `_get_batch_logps` after the last attempt.
-    #             # Concatenate prompt with completion for logit computation: (B, P+C)
-    #             prompt_completion_ids = torch.cat([grpo_inputs['prompt_ids'], grpo_inputs['completion_ids']], dim=1)  
-    #             attention_mask = torch.cat([grpo_inputs['prompt_mask'], grpo_inputs['completion_mask']], dim=1)
-    #             logits_to_keep = grpo_inputs['completion_ids'].size(1)  # we only need to compute the logits for the completion tokens
-    #             old_per_token_logps, ref_per_token_logps = self._get_batch_logps(
-    #                 prompt_completion_ids, attention_mask, logits_to_keep
-    #             )
-    #             grpo_inputs['old_per_token_logps'] = old_per_token_logps
-    #             grpo_inputs['ref_per_token_logps'] = ref_per_token_logps
-
-    #             # Put grpo inputs to the buffer for later reuse
-    #             self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = grpo_inputs
-    #         else:
-    #             grpo_inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
-    #         self._step += 1
-        
-    #     else:           # eval mode
-    #         # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer the grpo inputs.
-    #         grpo_inputs = self._generate_score_log_completions(inputs)
-    #     return grpo_inputs
     
     
     def _generate_completions(self, inputs, mode):
@@ -1288,48 +1240,6 @@ class GRPOTrainer(Trainer):
         # all_rewards: is the weighted sum of all_rewards_per_func and may be applied mask_truncated_completions then.
         # all_advantages: computed advantages (only enabled in train mode; is not needed in eval mode by default)
     
-
-    # # TODO: remove `_generate_score_log_completions`
-    # def _generate_score_log_completions(
-    #     self, 
-    #     inputs: list[str],
-    #     attempt: int = 1
-    # ) -> dict[str, Union[torch.Tensor, Any]]:
-    #     r"""
-    #     Generate and score the completions for given inputs.
-
-    #     Args:
-    #         inputs (`list[str]`):
-    #             List of input dataset.
-    #         attempt (`int`):
-    #             The n-th try to generate and score completions.
-
-    #     Return:
-    #         `dict[str, Union[torch.Tensor, Any]]`.
-    #     """
-    #     mode = self.mode
-
-    #     # Generate completions: augment inputs with generated completions
-    #     inputs = self._generate_completions(inputs)
-        
-    #     # Score completions
-    #     all_rewards_per_func, all_rewards, all_advantages = self._score_completions(inputs)
-    #     # Get the local slice of advantages (enabled only in train mode)
-    #     if mode == 'train':
-    #         start = self.accelerator.process_index * len(inputs['prompt_ids'])
-    #         advantages = all_advantages[start:start+len(inputs['prompt_ids'])]      # [i:i+len(prompts)]
-    #         inputs['advantages'] = advantages   # for compute loss
-    #     inputs['rewards'] = all_rewards         # for check model generation
-        
-        
-    #     # log the first attempt (may change it accordingly)
-    #     if attempt == 1:
-    #         self._log_completions(inputs, all_rewards_per_func, all_rewards)
-        
-    #     # Synchronize: wait for all processes to finish before continuing
-    #     self.accelerator.wait_for_everyone()
-        
-    #     return inputs 
         
 
     def _log_completions(self, inputs, all_rewards_per_func, all_rewards, mode):
@@ -2218,7 +2128,8 @@ class GRPOTrainer(Trainer):
         logger.info(f"  Num examples (raw train dataset) = {num_examples:,}")
         logger.info(f"  Num generations = {self.num_generations:,}")
         logger.info(f"  Num examples (w. num_generations) = {num_examples*self.num_generations:,}")
-        logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
+        # TODO: grpo num_iterations
+        # logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
         logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
         logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
         
@@ -2231,8 +2142,8 @@ class GRPOTrainer(Trainer):
         # logger.info(f"  Total train batch size = {total_train_batch_size:,}")
         # logger.info(f"                         = (world_size * per_device_train_batch_size * gradient_accumulation_steps)")
         
-        logger.info(f"  Num update steps per epoch (ceiled) = {num_update_steps_per_epoch:,}")
-        logger.info(f"  Total optimization steps = {max_steps:,}")
+        logger.info(f"  Training steps per epoch (ceiled) = {num_update_steps_per_epoch:,}")
+        logger.info(f"  Total training steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
         
         
@@ -2283,6 +2194,13 @@ class GRPOTrainer(Trainer):
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
         
+        # Training progress bar
+        if self.is_world_process_zero():
+            progress_bar = tqdm(
+                total=max_steps, 
+                dynamic_ncols=True, 
+                desc='Training step'
+            )
         
         # debug(0)
         
@@ -2386,27 +2304,37 @@ class GRPOTrainer(Trainer):
                     
                     
                     # 3. Check if current model generation meets specific criterion
-                    checkout = self.check_model_generation(all_rewards, **kwargs)
+                    checkout = self.check_model_generation(all_rewards.tolist(), **kwargs)
                     
                     if checkout == 'easy':
-                        logger.info(f"\n  [attempt={attempt}]: Current problems are too easy to solve. Skip to the next batch.")
+                        logger.info(f"\n  [{attempt=}]: Current problems are too easy for the model to solve, skip to the next batch.")
                         break
                     elif checkout == 'good':
                         # logger.info(f"\n  [rank={self.accelerator.process_index}][attempt={attempt}]: Current model generation is good.")
-                        logger.info(f"\n  [attempt={attempt}]: Current model generation is good.")
+                        logger.info(f"\n  [{attempt=}]: Current model generation is good.")
                         break
-                    elif attempt == max_attempts:
-                        logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, but max_attempts reached!")
-                    else:
-                        logger.info(f"\n  [attempt={attempt}]: Current model generation is not good, try again...")
+                    elif checkout == 'bad':
+                        if attempt < max_attempts:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is bad, try again...")
+                        else:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is bad, skip to the next batch.")
+                    elif checkout == 'hard':
+                        if attempt < max_attempts:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is not good, try again...")
+                        else:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is not good, but max_attempts reached!")
                 
                 if checkout in ['easy', 'bad']:
                     # Too easy/bad, skip to the next batch
                     # TODO: do progrees callback
-                    # TODO: only increase trainig bar, but global_step remian unchanged!
+                    # TODO: only update progress_bar, while global_step remian unchanged!
                     # self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                    if self.is_world_process_zero():
+                        progress_bar.update(1)
+                        print()
+
                     continue
                 
                 # checkout is good or hard at this point
@@ -2511,11 +2439,16 @@ class GRPOTrainer(Trainer):
                             self.lr_scheduler.step()
 
                     model.zero_grad()
-
+                    
+                    # update global step (optimizer step)
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-
+                    
+                    # update training progress bar
+                    if self.is_world_process_zero():
+                        progress_bar.update(1)
+                    
                     self._maybe_log_save_evaluate(
                         tr_loss, 
                         grad_norm, 
