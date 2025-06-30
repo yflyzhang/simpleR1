@@ -888,14 +888,15 @@ class GRPOTrainer(Trainer):
 
         # 1. Easy: full rewards for all generations
         # Note: the current question is too easy for the model as it can get full rewrds for all generations.
-        if min(rewards) == sum(self.reward_weights.tolist()):
+        # if min(rewards) == sum(self.reward_weights.tolist()):
+        if min(rewards) >= sum(self.reward_weights.tolist()):
             return 'easy'
         
         # 2. Bad: Nearly identical rewards, e.g., std=0
         # example: [10, 10, 10, 8]
         # if np.std(rewards) == 0:
-        if np.std(rewards) < 1e-3:
-        # RSD = std / mean, RSD > 0.1 is good.
+        if np.std(rewards) < 1e-2:
+        # RSD = std / mean, RSD > 0.1 is good?
         # TODO: change to other values or set by user
         # if np.std(rewards) / (np.mean(rewards) + 1e-6) < 0.1:
             return 'bad'
