@@ -427,13 +427,6 @@ class GRPOTrainer(Trainer):
         self.epsilon = args.epsilon                 # clip value (pi_theta/pi_old)
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # --------------------------
-        
-        # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle.
-        self._step = 0
-        # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
-        # `_get_train_sampler` and `prepare_grpo_inputs`.
-        self._buffered_inputs = [None] * args.gradient_accumulation_steps
-        # TODO: remove _buffered_inputs later?
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -466,6 +459,7 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
+        # TODO: dynamic sampling or not
         # Remove `transformers.trainer_callback.ProgressCallback`,
         # and add custom `GRPOProgressCallback`
         from transformers.trainer_callback import ProgressCallback
@@ -1429,6 +1423,9 @@ class GRPOTrainer(Trainer):
         r"""
         How the loss is computed by GRPOTrainer. Return loss only.
         """
+        # mode = self.mode
+        mode = 'train'
+
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
@@ -1461,6 +1458,12 @@ class GRPOTrainer(Trainer):
         per_token_adv1 = coef_1 * advantages.unsqueeze(1)
         per_token_adv2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_adv1, per_token_adv2)
+        
+        # Track policy gradient loss
+        # TODO: Check if this is correct
+        pg_loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        self._metrics[mode]["pg_loss"].append(self.accelerator.gather_for_metrics(pg_loss).mean().item())
+        
         if self.beta > 0.0:    # add kl loss if beta>0
             per_token_loss += self.beta * per_token_kl
         
@@ -1486,10 +1489,6 @@ class GRPOTrainer(Trainer):
         
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
-        
-        # Log the metrics
-        # mode = self.mode
-        mode = 'train'
         
         # Compute kl even when beta=0, to monitor model update
         if self.compute_kl:
@@ -2328,7 +2327,7 @@ class GRPOTrainer(Trainer):
                 if checkout in ['easy', 'bad']:
                     # Too easy/bad, skip to the next batch
                     # TODO: do progrees callback
-                    # TODO: only update progress_bar, while global_step remian unchanged!
+                    # Only update progress_bar, while global_step remains unchanged!
                     # self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -2360,109 +2359,141 @@ class GRPOTrainer(Trainer):
                 
                 # model inputs are well prepared now, goto training_step
 
-                # TODO: clean context
-                # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
-                # context = (
-                #     functools.partial(self.accelerator.no_sync, model=model)
-                #     if i != len(batch_samples) - 1
-                #     and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                #     else contextlib.nullcontext
-                # )
-                context = contextlib.nullcontext
-                with context():
-                # with self.accelerator.accumulate(model):
-                    # Training step for one batch sample
-                    tr_loss_step = self.training_step(model, processed_inputs)
-                
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_xla_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    if tr_loss.device != tr_loss_step.device:
-                        raise ValueError(
-                            f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                # TODO: add grpo iteration, but should move global_step, epoch and on_step_end outside
+                 # -----------------------------------------------
+                # Train the batch sample in multi-grpo iterations
+                for iteration in range(self.num_iterations):
+                    self.grpo_iteration = iteration     # tracks current grpo_iteration
+                # -----------------------------------------------
+
+                    # TODO: clean context
+                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
+                    # context = (
+                    #     functools.partial(self.accelerator.no_sync, model=model)
+                    #     if i != len(batch_samples) - 1
+                    #     and self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                    #     else contextlib.nullcontext
+                    # )
+                    context = contextlib.nullcontext
+                    with context():
+                    # with self.accelerator.accumulate(model):
+                        # Training step for one batch sample
+                        tr_loss_step = self.training_step(model, processed_inputs)
+                    
+                    if (
+                        args.logging_nan_inf_filter
+                        and not is_torch_xla_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    ):
+                        # if loss is nan or inf simply add the average of previous logged losses
+                        tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    else:
+                        if tr_loss.device != tr_loss_step.device:
+                            raise ValueError(
+                                f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
+                            )
+                        tr_loss = tr_loss + tr_loss_step
+
+                    self.current_flos += float(self.floating_point_ops(processed_inputs))
+
+                    
+                    if do_sync_step:
+                        logger.info(
+                            f"optimizer.step: "
+                            # f"grpo_iteration={self.grpo_iteration+1}"
+                            # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"
                         )
-                    tr_loss = tr_loss + tr_loss_step
+                        # Since we perform prefetching, we need to manually set sync_gradients to True
+                        self.accelerator.gradient_state._set_sync_gradients(True)
 
-                self.current_flos += float(self.floating_point_ops(processed_inputs))
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                            if is_sagemaker_mp_enabled() and args.fp16:
+                                _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
+                            elif self.use_apex:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                _grad_norm = nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer),
+                                    args.max_grad_norm,
+                                )
+                            else:
+                                _grad_norm = self.accelerator.clip_grad_norm_(
+                                    model.parameters(),
+                                    args.max_grad_norm,
+                                )
 
+                            if (
+                                is_accelerate_available()
+                                and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                            ):
+                                grad_norm = model.get_global_grad_norm()
+                                # In some cases the grad norm may not return a float
+                                if hasattr(grad_norm, "item"):
+                                    grad_norm = grad_norm.item()
+                            else:
+                                grad_norm = _grad_norm
+                        
+                        # Update model parameter in each iteration
+                        self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+
+                        self.optimizer.step()
+
+                        self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+                        
+                        # if not self.accelerator.optimizer_step_was_skipped:
+                        #     # Delay optimizer scheduling until metrics are generated
+                        #     if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        #         self.lr_scheduler.step()
+
+                        model.zero_grad()
+                        
+                        # # update global step (after optimizer step)
+                        # self.state.global_step += 1
+                        # self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        
+                        # # update training progress bar
+                        # if self.is_world_process_zero():
+                        #     progress_bar.update(1)
+                        
+                        # self._maybe_log_save_evaluate(
+                        #     tr_loss, 
+                        #     grad_norm, 
+                        #     model, 
+                        #     trial, 
+                        #     epoch, 
+                        #     ignore_keys_for_eval, 
+                        #     start_time
+                        # )
+                    
+                    else:
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                    
+                # After multiple grpo iterations of one batch (instead of inside the loop)
+                # Update `lr_scheduler`, `global_step`, `epoch`, and call `on_step_end`
+                if not self.accelerator.optimizer_step_was_skipped:
+                    # Delay optimizer scheduling until metrics are generated
+                    if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.lr_scheduler.step()
                 
-                if do_sync_step:
-                    logger.info(
-                        f"optimizer.step: "
-                        # f"grpo_iteration={self.grpo_iteration+1}"
-                        # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"
-                    )
-                    # Since we perform prefetching, we need to manually set sync_gradients to True
-                    self.accelerator.gradient_state._set_sync_gradients(True)
-
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif self.use_apex:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            _grad_norm = nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer),
-                                args.max_grad_norm,
-                            )
-                        else:
-                            _grad_norm = self.accelerator.clip_grad_norm_(
-                                model.parameters(),
-                                args.max_grad_norm,
-                            )
-
-                        if (
-                            is_accelerate_available()
-                            and self.accelerator.distributed_type == DistributedType.DEEPSPEED
-                        ):
-                            grad_norm = model.get_global_grad_norm()
-                            # In some cases the grad norm may not return a float
-                            if hasattr(grad_norm, "item"):
-                                grad_norm = grad_norm.item()
-                        else:
-                            grad_norm = _grad_norm
-                    
-                    # Update model parameter in each iteration
-                    self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-
-                    self.optimizer.step()
-
-                    self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
-                    
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
-
-                    model.zero_grad()
-                    
-                    # update global step (optimizer step)
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                    
-                    # update training progress bar
-                    if self.is_world_process_zero():
-                        progress_bar.update(1)
-                    
-                    self._maybe_log_save_evaluate(
-                        tr_loss, 
-                        grad_norm, 
-                        model, 
-                        trial, 
-                        epoch, 
-                        ignore_keys_for_eval, 
-                        start_time
-                    )
+                self.state.global_step += 1
+                self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                 
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                # update training progress bar
+                if self.is_world_process_zero():
+                    progress_bar.update(1)
                 
+                self._maybe_log_save_evaluate(
+                    tr_loss, 
+                    grad_norm, 
+                    model, 
+                    trial, 
+                    epoch, 
+                    ignore_keys_for_eval, 
+                    start_time
+                )
+
                 # PyTorch/XLA relies on the data loader to insert the mark_step for
                 # each step. Since we are breaking the loop early, we need to manually
                 # insert the mark_step here.
