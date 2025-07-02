@@ -418,6 +418,7 @@ class GRPOTrainer(Trainer):
         self.mode = None                            # train or eval mode
         self.grpo_iteration = 0                     # tracks current grpo iteration
         self.mini_batch_step = -1                   # tracks mini-batch step
+        self.dynamic_sampling = args.dynamic_sampling 
         self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
         self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
@@ -459,13 +460,14 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
-        # TODO: dynamic sampling or not
-        # Remove `transformers.trainer_callback.ProgressCallback`,
-        # and add custom `GRPOProgressCallback`
-        from transformers.trainer_callback import ProgressCallback
-        self.callback_handler.pop_callback(ProgressCallback)
-        self.callback_handler.add_callback(GRPOProgressCallback)
-        # self.callback_handler.callbacks
+        # Dynamic sampling or not
+        if self.dynamic_sampling:
+            # Remove `transformers.trainer_callback.ProgressCallback`,
+            # and add custom `GRPOProgressCallback`
+            from transformers.trainer_callback import ProgressCallback
+            self.callback_handler.pop_callback(ProgressCallback)
+            self.callback_handler.add_callback(GRPOProgressCallback)
+            # self.callback_handler.callbacks
         
         # debug(0)
         
@@ -859,7 +861,7 @@ class GRPOTrainer(Trainer):
 
             return loss.detach()
     
-
+    
     def check_model_generation(self, rewards, **kwargs):
         r"""
         Check if current generation meets specific criterion based on rewards.
@@ -1743,7 +1745,7 @@ class GRPOTrainer(Trainer):
         
         # batch_size = self.args.eval_batch_size
         effective_batch_size = self.args.per_device_eval_batch_size * self.accelerator.num_processes
-        logger.info("\n\n***** Evaluate *****")
+        logger.info("\n\n\n***** Evaluate *****")
         logger.info(f"***** Running {description} *****")
         if has_length(dataloader):
             num_examples = self.num_examples(dataloader)
@@ -2129,7 +2131,7 @@ class GRPOTrainer(Trainer):
         logger.info(f"  Num generations = {self.num_generations:,}")
         logger.info(f"  Num examples (w. num_generations) = {num_examples*self.num_generations:,}")
         # TODO: grpo num_iterations
-        # logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
+        logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
         logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
         logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
         
@@ -2194,17 +2196,20 @@ class GRPOTrainer(Trainer):
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
         
-        # Training progress bar
-        if self.is_world_process_zero():
-            progress_bar = tqdm(
-                total=max_steps, 
-                dynamic_ncols=True, 
-                desc='Training step'
-            )
+        # Training data progress bar
+        # Note: If dynamic sampling is enabled, there will be two progress bars:
+        # one for the training data progress   (desc. defaults to `Training data step`, see below),
+        # the other for the optimizer progress (desc. defaults to `Optimizing step`, see callbacks.py).
+        if self.dynamic_sampling:
+            if self.is_world_process_zero():
+                progress_bar = tqdm(
+                    total=max_steps, 
+                    dynamic_ncols=True, 
+                    desc='Training data step'
+                )
         
         # debug(0)
         
-        total_batched_samples = 0
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader
             if hasattr(epoch_dataloader, "set_epoch"):
@@ -2235,7 +2240,6 @@ class GRPOTrainer(Trainer):
             step = -1   # note: should take num_iterations into consideration when using `step`
             epoch_iterator = iter(epoch_dataloader)
             for step, inputs in enumerate(epoch_iterator):
-                total_batched_samples += 1
                 
                 # TODO: deal with num_iterations (grpo iteration)
                 do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
@@ -2324,21 +2328,21 @@ class GRPOTrainer(Trainer):
                         else:
                             logger.info(f"\n  [{attempt=}]: Current model generation is not good, but max_attempts reached!")
                 
-                if checkout in ['easy', 'bad']:
-                    # Too easy/bad, skip to the next batch
-                    # TODO: do progrees callback
-                    # Only update progress_bar, while global_step remains unchanged!
-                    # self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                    if self.is_world_process_zero():
-                        progress_bar.update(1)
-                        print()
-
-                    continue
+                if self.dynamic_sampling:
+                    if checkout in ['easy', 'bad']:
+                        # Too easy/bad, skip to the next batch
+                        # TODO: do progrees callback
+                        # Only update progress_bar, while global_step remains unchanged!
+                        # self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        if self.is_world_process_zero():
+                            progress_bar.update(1)
+                            print()
+                        continue
                 
-                # checkout is good or hard at this point
-
+                # If dynamic sampling is enabled, checkout is good or hard at this point
+                
                 # 4. Log completions
                 self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='train')
 
@@ -2358,13 +2362,11 @@ class GRPOTrainer(Trainer):
                 processed_inputs['ref_per_token_logps'] = ref_per_token_logps
                 
                 # model inputs are well prepared now, goto training_step
-
-                # TODO: add grpo iteration, but should move global_step, epoch and on_step_end outside
-                 # -----------------------------------------------
+                
+                # TODO: add grpo iteration
                 # Train the batch sample in multi-grpo iterations
                 for iteration in range(self.num_iterations):
                     self.grpo_iteration = iteration     # tracks current grpo_iteration
-                # -----------------------------------------------
 
                     # TODO: clean context
                     # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
@@ -2400,7 +2402,7 @@ class GRPOTrainer(Trainer):
                     if do_sync_step:
                         logger.info(
                             f"optimizer.step: "
-                            # f"grpo_iteration={self.grpo_iteration+1}"
+                            f"grpo_iteration={self.grpo_iteration+1}"
                             # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"
                         )
                         # Since we perform prefetching, we need to manually set sync_gradients to True
@@ -2480,9 +2482,10 @@ class GRPOTrainer(Trainer):
                 self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                 self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                 
-                # update training progress bar
-                if self.is_world_process_zero():
-                    progress_bar.update(1)
+                if self.dynamic_sampling:
+                    # Update training progress bar
+                    if self.is_world_process_zero():
+                        progress_bar.update(1)
                 
                 self._maybe_log_save_evaluate(
                     tr_loss, 
@@ -2493,7 +2496,7 @@ class GRPOTrainer(Trainer):
                     ignore_keys_for_eval, 
                     start_time
                 )
-
+                
                 # PyTorch/XLA relies on the data loader to insert the mark_step for
                 # each step. Since we are breaking the loop early, we need to manually
                 # insert the mark_step here.
@@ -2555,7 +2558,7 @@ class GRPOTrainer(Trainer):
         self._total_loss_scalar += tr_loss.item()
         effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
         train_loss = self._total_loss_scalar / effective_global_step
-
+        
         metrics = speed_metrics(
             "train",
             start_time,
@@ -2566,7 +2569,7 @@ class GRPOTrainer(Trainer):
         self.store_flos()
         metrics["total_flos"] = self.state.total_flos
         metrics["train_loss"] = train_loss
-
+        
         self.is_in_train = False
 
         self._memory_tracker.stop_and_update_metrics(metrics)

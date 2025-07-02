@@ -594,6 +594,10 @@ class GRPOTrainingArguments(TrainingArguments):
             "deviation introduces a question-level difficulty bias."
         },
     )
+    dynamic_sampling: bool = field(
+        default=False, 
+        metadata={"help": "Whether to use dyamic sampling, which may filter out low-quality samples."}
+    )
     max_resample_attempts: int = field(
         default=10,
         metadata={"help": "Max number of attempts per prompt in model generation."},

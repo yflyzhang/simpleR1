@@ -41,7 +41,7 @@ class GRPOProgressCallback(TrainerCallback):
         self.max_str_len = max_str_len
     
     def on_train_begin(self, args, state, control, **kwargs):
-        desc=kwargs.get("desc", "Optimize step")
+        desc=kwargs.get("desc", "Optimizing step")
         if state.is_world_process_zero:
             self.training_bar = tqdm(
                 # total=state.max_steps,
