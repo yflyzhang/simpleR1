@@ -56,6 +56,7 @@ MASTER_PORT=$(shuf -n 1 -i 10000-65535)
  
 # export CUDA_VISIBLE_DEVICES=0,1,2
 export CUDA_VISIBLE_DEVICES=0
+export VLLM_LOGGING_LEVEL=WARNING
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
@@ -82,8 +83,9 @@ src/run_grpo.py \
     --num_eval_generations 1 \
     --per_device_train_batch_size 7 \
     --per_device_eval_batch_size 64 \
+    --dynamic_sampling True \
     --max_resample_attempts 3 \
-    --gradient_accumulation_steps 3 \
+    --gradient_accumulation_steps 1 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --max_num_train_samples 2000 \
@@ -111,7 +113,7 @@ src/run_grpo.py \
     --eval_steps 10 \
     --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-$(basename $train_dataset) \
+    --wandb_project simpleR1-test \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
