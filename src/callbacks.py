@@ -40,6 +40,8 @@ class GRPOProgressCallback(TrainerCallback):
         self.prediction_bar = None
         self.max_str_len = max_str_len
     
+    # TODO: Use `on_train_begin` to replace the original one. 
+    # For example, total is only disabled during dynamic sampling.
     def on_train_begin(self, args, state, control, **kwargs):
         desc=kwargs.get("desc", ">> Optimizing step")
         if state.is_world_process_zero:

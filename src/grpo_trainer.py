@@ -302,7 +302,7 @@ class GRPOTrainer(Trainer):
         # TODO: 
         if args.gradient_accumulation_steps != 1:
             # only support gradient_accumulation_steps = 1
-            logger.warning(f"Invalid gradient_accumulation_steps. Expected to be 1.")
+            logger.warning(f"Invalid gradient_accumulation_steps. Set to be 1 now.")
             args.gradient_accumulation_steps = 1
         
         self.beta = args.beta
@@ -457,6 +457,7 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
+        # TODO: Use custom progress callback both for dynamic and non-dynamic sampling
         # Dynamic sampling or not
         if self.dynamic_sampling:
             # Remove `transformers.trainer_callback.ProgressCallback`,
@@ -1178,7 +1179,7 @@ class GRPOTrainer(Trainer):
         # Print reward info in the main process
         # if self.accelerator.is_main_process:
         all_completions_length = all_eos_idx + (all_eos_idx < max_completion_length).int()
-        print()     # for better readability only
+        print('\n')     # for better readability only
         
         # Note: By default, log level in the main process is set to INFO, while the rest processes are set to WARNING.
         if mode == 'train':
@@ -1757,7 +1758,7 @@ class GRPOTrainer(Trainer):
             # 3. Log completions
             self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='eval')
             
-            # TODO: fix on_prediction_step: on_prediction_begin, then on_prediction_step?
+            # TODO: Add `on_prediction_begin` before `on_prediction_step`?
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
             # Ref: ProgressCallback.on_prediction_step
             # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
@@ -2388,11 +2389,6 @@ class GRPOTrainer(Trainer):
                 # end of one batch step
                 self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                 
-                # Update training progress bar
-                if self.dynamic_sampling:
-                    if self.is_world_process_zero():
-                        progress_bar.update(1)
-                
                 # Maybe log, save, and evaluate
                 self._maybe_log_save_evaluate(
                     tr_loss, 
@@ -2403,6 +2399,12 @@ class GRPOTrainer(Trainer):
                     ignore_keys_for_eval, 
                     start_time
                 )
+                
+                # Update training progress bar
+                if self.dynamic_sampling:
+                    if self.is_world_process_zero():
+                        progress_bar.update(1)
+                        print()
                 
                 # PyTorch/XLA relies on the data loader to insert the mark_step for
                 # each step. Since we are breaking the loop early, we need to manually
