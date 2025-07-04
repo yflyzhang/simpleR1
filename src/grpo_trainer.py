@@ -104,8 +104,6 @@ def debug(rank=0):
     # Add a distributed breakpoint for debug for a specific rank
     torch.distributed.breakpoint(rank=rank)
 
-# breakpoint()
-
 
 class RepeatRandomSampler(Sampler):
     r"""
@@ -417,7 +415,6 @@ class GRPOTrainer(Trainer):
         # --------------------------
         self.mode = None                            # train or eval mode
         self.grpo_iteration = 0                     # tracks current grpo iteration
-        self.mini_batch_step = -1                   # tracks mini-batch step
         self.dynamic_sampling = args.dynamic_sampling 
         self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
@@ -468,8 +465,6 @@ class GRPOTrainer(Trainer):
             self.callback_handler.pop_callback(ProgressCallback)
             self.callback_handler.add_callback(GRPOProgressCallback)
             # self.callback_handler.callbacks
-        
-        # debug(0)
         
         # Note: the log level (of logger) is set depending on the node. 
         # By default, the main process (rank 0) logs at level INFO, while other processes log at level WARNING.
@@ -650,33 +645,26 @@ class GRPOTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt", "problem", "solution"]
     
-    # TODO: remove mini-batch
+
     def _get_train_sampler(self) -> Sampler:
         # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
         
-        # In the following illustration, values are the prompt indices. The first row indictaes the first sampled mini-batch, 
+        # In the following illustration, values under  are the prompt indices. The first row indictaes the first sampled mini-batch, 
         # the second row indicates the second sampled mini-batch, and so on.
         #
-        #                                                 |     GPU 0     |     GPU 1     |     GPU 2    |
-        #                            grpo
-        #            global_step   iteration   mini-batch   <───────>  num_generations=3
-        #                                                   <───────────> per_device_train_batch_size=4
-        #                ▲   0          0          1        0   0   0   1   1   1   2   2   2   3   3   3  │
-        #  grad_accum=3  │   0          0          2        4   4   4   5   5   5   6   6   6   7   7   7  │ Generate completions for each prompt
-        #                ▼   0          0          3        8   8   8   9   9   9  10  10  10  11  11  11  │
+        #                                               |     GPU 0     |     GPU 1     |     GPU 2    |
+        #                    batch   grpo_iteration       <───────>  num_generations=3
+        #                                                 <───────────> per_device_train_batch_size=4
+        #                      1          1               0   0   0   1   1   1   2   2   2   3   3   3  │ Generate completions for each prompt   
+        #                      1          2               0   0   0   1   1   1   2   2   2   3   3   3  │ Reuse the completions for the next grpo iteration
         #
-        #                    0          1          1        0   0   0   1   1   1   2   2   2   3   3   3  │ The sampled prompts are the same as in the first iteration
-        #                    0          1          2        4   4   4   5   5   5   6   6   6   7   7   7  │ Reuse the completions (here, once, because num_iterations=2)
-        #                    0          1          3        8   8   8   9   9   9  10  10  10  11  11  11  │
-        #
-        #                    1          0          1       12  12  12  13  13  13  14  14  14  15  15  15  │ 
-        #                    1          0          2       16  16  16  17  17  17  18  18  18  19  19  19  │ Next batched samples
-        #                    1          0          3       20  20  20  21  21  21  22  22  22  23  23  23  │
-        #                                                  ...
-
+        #                      2          1               4   4   4   5   5   5   6   6   6   7   7   7  │ Next batched samples
+        #                      2          2               4   4   4   5   5   5   6   6   6   7   7   7  │
+        #                                        ...
+        
         return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
     
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
@@ -779,7 +767,6 @@ class GRPOTrainer(Trainer):
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
         
         # train_dataloader = DataLoader(train_dataset, **dataloader_params)
-        
         # debug(0)
         # Note: After `accelerator.prepare`, len(train_dataloader) may be changed if we use data parallel.
         
@@ -809,23 +796,19 @@ class GRPOTrainer(Trainer):
         Ref: 
             https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L3668
         """
+        self.mode = 'train'
         model.train()
+
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
             self.optimizer.train()
-        
-        # ----------------------------------------
-        # Prepare grpo inputs: generate, score and log the completions
-        self.mode = 'train'
-        # inputs = self.prepare_grpo_inputs(inputs)
-        # ----------------------------------------
         
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
-
+        
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
-
+        
         del inputs
         gc.collect()
 
@@ -880,20 +863,17 @@ class GRPOTrainer(Trainer):
                 "good": Current generations are diverse with at least one right answer.
         """
 
-        # TODO: if no dynamic sampling, simply return 'good'
-
         # 1. Easy: full rewards for all generations
         # Note: the current question is too easy for the model as it can get full rewrds for all generations.
-        # if min(rewards) == sum(self.reward_weights.tolist()):
         if min(rewards) >= sum(self.reward_weights.tolist()):
             return 'easy'
         
         # 2. Bad: Nearly identical rewards, e.g., std=0
-        # example: [10, 10, 10, 8]
+        # example: [10, 10, 10, 9.99]
         # if np.std(rewards) == 0:
         if np.std(rewards) < 1e-2:
-        # RSD = std / mean, RSD > 0.1 is good?
         # TODO: change to other values or set by user
+        # For examepls, RSD = std / mean, RSD > 0.1 is good?
         # if np.std(rewards) / (np.mean(rewards) + 1e-6) < 0.1:
             return 'bad'
         
@@ -901,12 +881,11 @@ class GRPOTrainer(Trainer):
         # If no generation arrives at the right answer, try it again.
         if max(rewards) < max(self.reward_weights.tolist()):    
             return 'hard'
-        # # If no generation get the full reward, try it again.
+        # TODO: If no generation get the full reward, try it again.
         # if max(rewards) < sum(self.reward_weights.tolist()):   
         #     return 'hard
         
-        # TODO: 
-        # Check other conditions, e.g., generation diversity, entropy
+        # TODO: Check other conditions, e.g., generation diversity, entropy
         
         # 4. Good: All rewards are within a certain range (with at least one right answer)
         return 'good'
@@ -925,8 +904,7 @@ class GRPOTrainer(Trainer):
         Return:
             `dict[str, Union[torch.Tensor, Any]]`.
         """
-        # TODO: remove self.mode
-        # mode = self.mode
+
         device = self.accelerator.device
         problems = [example["problem"] for example in inputs]   # raw problems
         prompts = [example["prompt"] for example in inputs]     # raw prompts
@@ -1080,10 +1058,7 @@ class GRPOTrainer(Trainer):
                 # completions.append({"role": "assistant", "content": bootstrap + completion})    # single-turn only
         else:
             completions = completion_texts
-
         
-        # debug(0)
-
         return {
             # 1. text
             "problems": problems,
@@ -1142,7 +1117,9 @@ class GRPOTrainer(Trainer):
             if isinstance(
                 reward_func, nn.Module
             ):  # Module instead of PretrainedModel for compat with compiled models
-                # if is_conversational(inputs[0]):    
+                # Get each model-based reward
+                # TODO: check if this still works or is needed
+                # if is_conversational(inputs[0]): 
                 if is_messages(completions[0]): # to be verified here
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
@@ -1208,23 +1185,19 @@ class GRPOTrainer(Trainer):
             logger.info(
                 f"\n  [{mode}] global_step = {self.state.global_step+1},"
                 f" grpo_iteration = {self.grpo_iteration+1},"
-                # f" mini_batch (grad. acc.) = {self.mini_batch_step+1}"
                 f"\n    completion length = {all_completions_length.cpu().tolist()}"
                 f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
                 f"\n    total reward      = {all_rewards.cpu().tolist()}"
                 f"\n    advantage         = {[round(x, 3) for x in all_advantages.detach().cpu().tolist()]}"
             )
         else:
-            # accuracy is the primary goal!
+            # accuracy is the primary goal?!
             logger.info(
                 f"\n  [{mode}] global_step = {self.state.global_step}"
                 f"\n    completion length = {all_completions_length.cpu().tolist()}"
                 f"\n    accuracy reward   = {all_accuracy_reward.cpu().tolist()}"
                 # f"\n    total reward      = {all_rewards.cpu().tolist()}"
             )
-    
-        
-        # debug(0)
         
         # return all device rewards/advantages
         return (
@@ -1236,9 +1209,8 @@ class GRPOTrainer(Trainer):
         # all_rewards_per_func: tracks the the raw reward (0.0-1.0) for each reward function.
         # all_rewards: is the weighted sum of all_rewards_per_func and may be applied mask_truncated_completions then.
         # all_advantages: computed advantages (only enabled in train mode; is not needed in eval mode by default)
-    
         
-
+        
     def _log_completions(self, inputs, all_rewards_per_func, all_rewards, mode):
         r"""
         Log completions (append/extend) in list of buffers `_metrics` and `_completion_examples`.
@@ -1253,7 +1225,6 @@ class GRPOTrainer(Trainer):
             mode (`str`):
                 The mode of generation. Can be `"train"` or `"eval"`.
         """
-        # mode = self.mode
         if mode == 'train':
             num_generations = self.num_generations
             max_completion_length = self.max_completion_length
@@ -1328,7 +1299,6 @@ class GRPOTrainer(Trainer):
             # Completion table to be logged later
             completion_table = {
                 "global_step": [global_step] * len(all_completions_length),
-                # "mini_batch": [self.mini_batch_step+1] * len(all_completions_length),
                 "problem": gather_object(problems_text),
                 "solution": gather_object(solutions_text),
                 "completion": gather_object(completion_texts),
@@ -1450,8 +1420,8 @@ class GRPOTrainer(Trainer):
         
         # Compute the loss
         advantages = inputs["advantages"]
-        # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
-        # `_generate_score_log_completions`) and use per_token_logps.detach() instead.
+        # When using num_iterations == 1, old_per_token_logps == per_token_logps, 
+        # so we can skip it's computation and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         # Clip higher to promote diversity and precent entropy collapse (ref: DAPO)
@@ -1461,8 +1431,7 @@ class GRPOTrainer(Trainer):
         per_token_adv2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_adv1, per_token_adv2)
         
-        # Track policy gradient loss
-        # TODO: Check if this is correct
+        # Track policy gradient (pg) loss
         pg_loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         self._metrics[mode]["pg_loss"].append(self.accelerator.gather_for_metrics(pg_loss).mean().item())
         
@@ -1694,14 +1663,11 @@ class GRPOTrainer(Trainer):
         
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
-
+        
         dataloader = self.get_eval_dataloader(eval_dataset)
         if self.is_fsdp_xla_v2_enabled:
             dataloader = tpu_spmd_dataloader(dataloader)
-
         
-        # debug(0)
-
         start_time = time.time()
         
         # `evaluation_loop`
@@ -1782,9 +1748,7 @@ class GRPOTrainer(Trainer):
             # Ref: self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
             #   https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4487
             
-            # generate, score, and log completions (`_generate_score_log_completions` in eval mode)
-            # grpo_inputs = self.prepare_grpo_inputs(inputs)
-            # TODO: return None if grpo_inputs is not used.
+            # Generate, score, and log completions in eval mode
 
             # 1. Generate completions: augment inputs with generated completions
             processed_inputs = self._generate_completions(inputs, mode='eval')
@@ -1792,7 +1756,8 @@ class GRPOTrainer(Trainer):
             all_rewards_per_func, all_rewards, all_advantages = self._score_completions(processed_inputs, mode='eval')
             # 3. Log completions
             self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='eval')
-
+            
+            # TODO: fix on_prediction_step: on_prediction_begin, then on_prediction_step?
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
             # Ref: ProgressCallback.on_prediction_step
             # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
@@ -1801,17 +1766,13 @@ class GRPOTrainer(Trainer):
             gc.collect()
             torch.cuda.empty_cache()
         
-        
-        # debug(0)
-        # torch.distributed.breakpoint(rank=1)
-        
         # Remove redundant eval samples (in main process only)
         # Note: This is important for the eval metrics for multi-device eval.
         # Example:
-        # Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
-        # if eval batch size is set to be 5, then we will have 2 batches: 
-        # [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
-        # We need to remove the redundant samples in the last batch.
+        #   Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
+        #   if eval batch size is set to be 5, then we will have two batches: 
+        #   [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
+        #   We need to remove the redundant samples in the last batch.
         if self.accelerator.is_main_process:
             num_samples = len(eval_dataset)
             keyword = list(self._metrics[mode].keys())[0]
@@ -1823,9 +1784,7 @@ class GRPOTrainer(Trainer):
                 
                 num_redundant = num_total_samples - num_samples
                 self._completion_examples[mode][-1] = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}
-                # new_dic = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}
-                # {k:len(v) for k,v in new_dic.items()}
-        
+                
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
         self.gather_function = self.accelerator.gather_for_metrics
         if args.past_index and hasattr(self, "_past"):
@@ -1858,18 +1817,13 @@ class GRPOTrainer(Trainer):
             # 'args.metric_for_best_model' can be set to 'xxx/accuracy_reward'.
         
         
-        # debug(0)
-        
-        # Log `_metrics` and `_completion_examples` in wandb
+        # Log `_metrics` and `_completion_examples` (in wandb or other logging systems)
         # self.log(metrics)
         self.log({}, mode='eval')
         
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)       
         
         self._memory_tracker.stop_and_update_metrics(metrics)
-        
-        
-        # debug(0)
         
         return metrics
     
@@ -1903,8 +1857,6 @@ class GRPOTrainer(Trainer):
             https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L2139
 
         """
-        # TODO: dynamic sampling: 
-        # skip too simple, resample hard
 
         if resume_from_checkpoint is False:
             resume_from_checkpoint = None
@@ -2003,9 +1955,6 @@ class GRPOTrainer(Trainer):
         num_train_samples = num_examples * self.num_generations * num_train_epochs  # multiply num_generations
         max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)   # max update steps, shown in traing bar
         
-        
-        
-        # debug(0)
 
         num_train_tokens = None
         if self.args.include_tokens_per_second:
@@ -2122,7 +2071,6 @@ class GRPOTrainer(Trainer):
         # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
         # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
         
-        # TODO: clean gradient accumulation
 
         # Train!
         logger.info("***** Running training *****")
@@ -2130,10 +2078,9 @@ class GRPOTrainer(Trainer):
         logger.info(f"  Num examples (raw train dataset) = {num_examples:,}")
         logger.info(f"  Num generations = {self.num_generations:,}")
         logger.info(f"  Num examples (w. num_generations) = {num_examples*self.num_generations:,}")
-        # TODO: grpo num_iterations
         logger.info(f"  Num iterations (𝜇 in GRPO) = {self.num_iterations:,}")
         logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
-        logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+        # logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
         
         if self.args.per_device_train_batch_size != self._train_batch_size:
             logger.info(f"  Training with DataParallel so batch size has been adjusted to: {self._train_batch_size:,}")
@@ -2148,8 +2095,6 @@ class GRPOTrainer(Trainer):
         logger.info(f"  Total training steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
         
-        
-        # debug(0)
 
         self.state.epoch = 0
         start_time = time.time()
@@ -2205,10 +2150,9 @@ class GRPOTrainer(Trainer):
                 progress_bar = tqdm(
                     total=max_steps, 
                     dynamic_ncols=True, 
-                    desc='Training data step'
+                    desc='>> Training data step'
                 )
         
-        # debug(0)
         
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader
@@ -2241,9 +2185,8 @@ class GRPOTrainer(Trainer):
             epoch_iterator = iter(epoch_dataloader)
             for step, inputs in enumerate(epoch_iterator):
                 
-                # TODO: deal with num_iterations (grpo iteration)
+                # TODO: Take care of gradient_accumulation_steps and grpo iteration
                 do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
-                # do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch * self.num_iterations
                 # Since we perform prefetching, we need to manually set sync_gradients
                 self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
                 
@@ -2277,37 +2220,28 @@ class GRPOTrainer(Trainer):
                     steps_trained_progress_bar.close()
                     steps_trained_progress_bar = None
                 
-                # Should take `num_iterations` into consideration or move it before grpo iteration starts
-                # if step % (args.gradient_accumulation_steps * self.num_iterations) == 0:
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                 
-                # TODO: generate and score and check here, 
-                # skip this batch if it's bad
 
                 # Rejection sampling for model generation
                 max_attempts = max(self.max_resample_attempts, 1) # maximum number of generation attempts
                 for attempt in range(1, max_attempts+1):
-                    # grpo_inputs = self._generate_score_log_completions(inputs, attempt=attempt)
-                    
+
                     # 1. Generate completions: augment inputs with generated completions
                     processed_inputs = self._generate_completions(inputs, mode='train')
                     
                     # 2. Score completions: get rewards for each completion
                     all_rewards_per_func, all_rewards, all_advantages = self._score_completions(processed_inputs, mode='train')
+                    
                     # Get the local slice of advantages (enabled only in train mode)
-                    
-                    # debug(0)
-                    
                     start = self.accelerator.process_index * len(processed_inputs['prompt_ids'])
                     advantages = all_advantages[start:start+len(processed_inputs['prompt_ids'])]      # [i:i+len(prompts)]
-                    
-                    # TODO
-                    processed_inputs['advantages'] = advantages   # for compute loss
-                    # processed_inputs['rewards'] = all_rewards         # for check model generation
+                    processed_inputs['advantages'] = advantages   # to compute loss
                     
                     
                     # 3. Check if current model generation meets specific criterion
+                    # Note: Change the logic here accordingly
                     checkout = self.check_model_generation(all_rewards.tolist(), **kwargs)
                     
                     if checkout == 'easy':
@@ -2328,11 +2262,11 @@ class GRPOTrainer(Trainer):
                         else:
                             logger.info(f"\n  [{attempt=}]: Current model generation is not good, but max_attempts reached!")
                 
+                # 4. Dynamic sampling: Skip to the next batch if it's too easy/bad 
+                # Note: Change the logic here accordingly
                 if self.dynamic_sampling:
                     if checkout in ['easy', 'bad']:
-                        # Too easy/bad, skip to the next batch
-                        # TODO: do progrees callback
-                        # Only update progress_bar, while global_step remains unchanged!
+                        # Note: Skip to the next batch. Only update progress_bar, while `global_step` remains unchanged!
                         # self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                         # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -2341,16 +2275,15 @@ class GRPOTrainer(Trainer):
                             print()
                         continue
                 
-                # If dynamic sampling is enabled, checkout is good or hard at this point
+                # If dynamic sampling is enabled, checkout is 'good' or 'hard' at this point
                 
-                # 4. Log completions
+                # 5. Log completions
                 self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='train')
-
+                
                 # # Synchronize: wait for all processes to finish before continuing
                 # self.accelerator.wait_for_everyone()
 
-                # Get per token logps (old_per_token_logps and ref_per_token_logps)
-                # TODO: Note: call `_get_batch_logps` after the last attempt.
+                # Get per token logps ('old_per_token_logps' and 'ref_per_token_logps')
                 # Concatenate prompt with completion for logit computation: (batch, prompt + completion)
                 prompt_completion_ids = torch.cat([processed_inputs['prompt_ids'], processed_inputs['completion_ids']], dim=1)  
                 attention_mask = torch.cat([processed_inputs['prompt_mask'], processed_inputs['completion_mask']], dim=1)
@@ -2361,13 +2294,12 @@ class GRPOTrainer(Trainer):
                 processed_inputs['old_per_token_logps'] = old_per_token_logps
                 processed_inputs['ref_per_token_logps'] = ref_per_token_logps
                 
-                # model inputs are well prepared now, goto training_step
+                # model inputs are well prepared now, goto `training_step`
                 
-                # TODO: add grpo iteration
-                # Train the batch sample in multi-grpo iterations
+                # Train the batch sample in multi-grpo iterations (`num_iterations`)
                 for iteration in range(self.num_iterations):
                     self.grpo_iteration = iteration     # tracks current grpo_iteration
-
+                    
                     # TODO: clean context
                     # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
                     # context = (
@@ -2403,7 +2335,6 @@ class GRPOTrainer(Trainer):
                         logger.info(
                             f"optimizer.step: "
                             f"grpo_iteration={self.grpo_iteration+1}"
-                            # f"\n    global_step={self.state.global_step+1}, grpo_iteration={self.grpo_iteration+1}, mini_batch_step (grad. acc.)={self.mini_batch_step+1}"
                         )
                         # Since we perform prefetching, we need to manually set sync_gradients to True
                         self.accelerator.gradient_state._set_sync_gradients(True)
@@ -2437,36 +2368,10 @@ class GRPOTrainer(Trainer):
                         
                         # Update model parameter in each iteration
                         self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-
                         self.optimizer.step()
-
                         self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
                         
-                        # if not self.accelerator.optimizer_step_was_skipped:
-                        #     # Delay optimizer scheduling until metrics are generated
-                        #     if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        #         self.lr_scheduler.step()
-
                         model.zero_grad()
-                        
-                        # # update global step (after optimizer step)
-                        # self.state.global_step += 1
-                        # self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                        # self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                        
-                        # # update training progress bar
-                        # if self.is_world_process_zero():
-                        #     progress_bar.update(1)
-                        
-                        # self._maybe_log_save_evaluate(
-                        #     tr_loss, 
-                        #     grad_norm, 
-                        #     model, 
-                        #     trial, 
-                        #     epoch, 
-                        #     ignore_keys_for_eval, 
-                        #     start_time
-                        # )
                     
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -2480,13 +2385,15 @@ class GRPOTrainer(Trainer):
                 
                 self.state.global_step += 1
                 self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                # end of one batch step
                 self.control = self.callback_handler.on_step_end(args, self.state, self.control)
                 
+                # Update training progress bar
                 if self.dynamic_sampling:
-                    # Update training progress bar
                     if self.is_world_process_zero():
                         progress_bar.update(1)
                 
+                # Maybe log, save, and evaluate
                 self._maybe_log_save_evaluate(
                     tr_loss, 
                     grad_norm, 
