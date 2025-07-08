@@ -550,8 +550,9 @@ class GRPOTrainer(Trainer):
                     #             * self.args.gradient_accumulation_steps,
                     # max_model_len=self.max_prompt_length + self.max_eval_completion_length,
                     # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                    # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                    seed=self.args.seed,
+                    seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+                    # seed=self.args.seed,
+                    # AssertionError: Seed must be set when using external launcher backend to make sure sampling results are the same across workers.
                     # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     # max_num_batched_tokens=4096,
                 )
@@ -573,7 +574,9 @@ class GRPOTrainer(Trainer):
                 min_p=0.0 if args.min_p is None else args.min_p,
                 repetition_penalty=args.repetition_penalty,
                 guided_decoding=guided_decoding,
+                # seed=self.args.seed,
             )
+            # TODO: maybe we can use a different seed for each worker for generation diversity
             
             # Sampling parameters for evaluation
             self.eval_sampling_params = SamplingParams(
@@ -586,6 +589,7 @@ class GRPOTrainer(Trainer):
                 min_p=0.0 if args.eval_min_p is None else args.eval_min_p,
                 repetition_penalty=args.repetition_penalty,
                 guided_decoding=guided_decoding,
+                # seed=self.args.seed,
             )
         
 
@@ -1559,11 +1563,27 @@ class GRPOTrainer(Trainer):
         if mode == "eval":
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
         
+        logs = {**logs, **metrics}      # raw logs + grpo metrics
+        # output = {**logs, **metrics}    # raw logs + grpo metrics
+        
+        self.state.log_history.append(logs)
+        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
+        # Ref: 
+        #   1. CallbackHandler.on_log
+        #       self.call_event("on_log", args, state, control, logs=logs)
+        #       https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L555
+        #   2. `ProgressCallback.on_log`
+        #       def on_log(self, args, state, control, logs=None, **kwargs):
+        #       https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L677
+        #   3. `WandbCallback.on_log`
+        #       def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        #       https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
+        
         # Log completion exmaples (i.e., prompt + solution + score) tables in main process
         if (
             self.accelerator.is_main_process and
             self.log_completions and 
-            # self.args.report_to and "wandb" in self.args.report_to and
+            self.args.report_to and "wandb" in self.args.report_to and
             self._completion_examples[mode]
         ):
             # Convert each dictionary in _completion_examples[mode] to a DataFrame and concatenate them
@@ -1571,29 +1591,14 @@ class GRPOTrainer(Trainer):
                 [pd.DataFrame(d) for d in self._completion_examples[mode]], 
                 ignore_index=True
             )
+            # Log the DataFrame as a wandb.Table
+            # Note: call `callback_handler.on_log` before wandb.log to make sure wandb is initialized
             wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
         
-        logs = {**logs, **metrics}      # raw logs + grpo metrics
-        # output = {**logs, **metrics}    # raw logs + grpo metrics
-        
-        # reset `_metrics` and `_completion_examples` buffers
+        # Reset `_metrics` and `_completion_examples` buffers
         self._metrics[mode].clear()
         self._completion_examples[mode].clear()
         
-        self.state.log_history.append(logs)
-        self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
-        
-        # Ref: 
-        # 1. CallbackHandler.on_log
-        #   self.call_event("on_log", args, state, control, logs=logs)
-        #   https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L555
-        # 2. `ProgressCallback.on_log`
-        #   def on_log(self, args, state, control, logs=None, **kwargs):
-        #   https://github.com/huggingface/transformers/blob/main/src/transformers/trainer_callback.py#L677
-        # 3. `WandbCallback.on_log`
-        #   def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        #   https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
-    
     
     def evaluate(
         self,
@@ -1676,10 +1681,12 @@ class GRPOTrainer(Trainer):
         description="Evaluation"
         args = self.args
         
+        # TODO: This can be deleted if use vllm. Reserved here for backward compatibility.
+        # if not self.use_vllm:
         # if eval is called w/o train, handle model prep here
         if self.is_deepspeed_enabled and self.deepspeed is None:
             _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
-        
+            
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
         
         if len(self.accelerator._models) == 0 and model is self.model:
@@ -1775,17 +1782,22 @@ class GRPOTrainer(Trainer):
         #   [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
         #   We need to remove the redundant samples in the last batch.
         if self.accelerator.is_main_process:
-            num_samples = len(eval_dataset)
-            keyword = list(self._metrics[mode].keys())[0]
-            num_total_samples = len(self._metrics[mode][keyword])
-            if num_total_samples > num_samples:
-                new_dic = {k:v[:num_samples] for k,v in self._metrics[mode].items()}
+            num_total_samples = num_examples * self.num_eval_generations    # raw samples * generations
+            num_returned_samples = num_update_steps_per_epoch * effective_batch_size    # samples returned to complete the last batch
+            num_redundants = num_returned_samples - num_total_samples
+            
+            # Remove redundant samples due to the last data batch
+            if num_redundants > 0:
+                # Note: `num_examples` is the number of raw examples in the dataset
+                # {k:len(v) for k,v in self._metrics[mode].items()}
+                new_dic = {k:v[:num_examples] for k,v in self._metrics[mode].items()}
                 self._metrics[mode].update(new_dic)     # update eval dict
                 
-                
-                num_redundant = num_total_samples - num_samples
-                self._completion_examples[mode][-1] = {k:v[:-num_redundant] for k,v in self._completion_examples[mode][-1].items()}
-                
+                # Filter the last batch only since it may contain redundant samples
+                self._completion_examples[mode][-1] = {k:v[:-num_redundants] for k,v in self._completion_examples[mode][-1].items()}
+                # {k:len(v) for k,v in self._completion_examples[mode][-1].items()}
+                # Note: `_completion_examples` is the list of batched results
+        
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
         self.gather_function = self.accelerator.gather_for_metrics
         if args.past_index and hasattr(self, "_past"):

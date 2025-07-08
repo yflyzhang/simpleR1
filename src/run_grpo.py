@@ -72,7 +72,6 @@ def main():
             time.sleep(wait_time)  # Check every wait_time seconds
         print("GPU is free, proceeding with next step.")
     
-    
     # Set seed for reproducibility
     set_seed(training_args.seed)
 
@@ -105,23 +104,32 @@ def main():
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
     
+    # do_train / do_eval
+    if training_args.eval_strategy != "no":
+        # Note: `TrainingArguments.__post_init__` already sets it
+        training_args.do_eval = True
+    logger.info(f"do_train: {training_args.do_train}")
+    logger.info(f"do_eval: {training_args.do_eval}")
+    
     ##################
     # Load the dataset
     ##################
     system_prompt = training_args.system_prompt
-    train_dataset = get_dataset(
-        script_args.train_dataset_name, split='train', system_prompt=system_prompt
-    )
 
-    # Note: Use a small dataset for fast check. Should be commented in production!
-    # Make sure it's called after data preprocessing
-    if script_args.max_num_train_samples is not None and script_args.max_num_train_samples > 0:
-        num_samples = min(script_args.max_num_train_samples, len(train_dataset))
-        sample_ids = random.sample(range(len(train_dataset)), num_samples)
-        train_dataset = train_dataset.select(sample_ids)    
-
+    train_dataset = None
+    if training_args.do_train and script_args.train_dataset_name:
+        train_dataset = get_dataset(
+            script_args.train_dataset_name, split='train', system_prompt=system_prompt
+        )
+        # Note: Can use a small dataset for fast check.
+        # Make sure it's called after data preprocessing
+        if script_args.max_num_train_samples is not None and script_args.max_num_train_samples > 0:
+            num_samples = min(script_args.max_num_train_samples, len(train_dataset))
+            sample_ids = random.sample(range(len(train_dataset)), num_samples)
+            train_dataset = train_dataset.select(sample_ids)    
+    
     eval_dataset = None
-    if script_args.eval_dataset_name:
+    if training_args.do_eval and script_args.eval_dataset_name:
         eval_dataset = get_dataset(
             script_args.eval_dataset_name, split='test', system_prompt=system_prompt
         )
@@ -130,10 +138,8 @@ def main():
             sample_ids = random.sample(range(len(eval_dataset)), num_samples)
             eval_dataset = eval_dataset.select(sample_ids)
     
-    
     # # >>>>> add a breakpoint for debug? <<<<<
     # torch.distributed.breakpoint(rank=0)
-    
     
     ################
     # Load tokenizer
@@ -202,7 +208,12 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_init_kwargs)
     
     # Reference model
-    if (training_args.beta == 0.0 and not training_args.compute_kl) or is_peft_model(model):
+    if (
+        not training_args.do_train      # not do_train (do_eval only)
+        or (training_args.beta == 0.0 and not training_args.compute_kl)     # do_train but no kl
+        or is_peft_model(model)         # PEFT model
+    ):
+        # If not do_train (do_eval only), the reference model is not needed
         # If beta is 0.0, the reference model is not needed
         # If PEFT is used, the reference model is not needed since the adapter can be disabled
         # to revert to the initial model.
@@ -240,54 +251,57 @@ def main():
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
         peft_config=get_peft_config(model_args),  
     )
+
+    # # >>>>> add a breakpoint for debug? <<<<<
+    # torch.distributed.breakpoint(rank=0)
     
     ###############
     # Training loop
     ###############
-    logger.info("*** Train ***")
-    
-    # Check for last checkpoint when necessary
-    checkpoint = None
-    if not training_args.overwrite_output_dir:  # defaults to not overwrite
-        if training_args.resume_from_checkpoint is not None:
-            # TrainingArguments.resume_from_checkpoint (`str`, *optional*): 
-            # The path to a folder with a valid checkpoint for your model.
-            if os.path.isdir(training_args.resume_from_checkpoint):
-                checkpoint = training_args.resume_from_checkpoint
-            else:
-                logger.warning(
-                    f"'resume_from_checkpoint' is not detected at {training_args.resume_from_checkpoint}."
-                    "Will train from scratch."
-                )
-        elif os.path.isdir(training_args.output_dir):
-            # Continue training if output_dir points to a checkpoint directory
-            checkpoint = get_last_checkpoint(training_args.output_dir)
-            if checkpoint is not None:
-                logger.info(f"Checkpoint detected, resuming training at {checkpoint=}.")
-    
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    metrics = train_result.metrics
-    metrics["train_samples"] = len(train_dataset)
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    trainer.save_state()
+    if training_args.do_train:
+        logger.info("*** Train ***")
+        # Check for last checkpoint when necessary
+        checkpoint = None
+        if not training_args.overwrite_output_dir:  # defaults to not overwrite
+            if training_args.resume_from_checkpoint is not None:
+                # TrainingArguments.resume_from_checkpoint (`str`, *optional*): 
+                # The path to a folder with a valid checkpoint for your model.
+                if os.path.isdir(training_args.resume_from_checkpoint):
+                    checkpoint = training_args.resume_from_checkpoint
+                else:
+                    logger.warning(
+                        f"'resume_from_checkpoint' is not detected at {training_args.resume_from_checkpoint}."
+                        "Will train from scratch."
+                    )
+            elif os.path.isdir(training_args.output_dir):
+                # Continue training if output_dir points to a checkpoint directory
+                checkpoint = get_last_checkpoint(training_args.output_dir)
+                if checkpoint is not None:
+                    logger.info(f"Checkpoint detected, resuming training at {checkpoint=}.")
+        
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        metrics = train_result.metrics
+        metrics["train_samples"] = len(train_dataset)
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
 
-    #############
-    # Save model
-    #############
-    logger.info("*** Save model ***")
-    trainer.save_model(training_args.output_dir)
-    logger.info(f"Model saved to {training_args.output_dir}")
+        #############
+        # Save model
+        #############
+        logger.info("*** Save model ***")
+        trainer.save_model(training_args.output_dir)
+        logger.info(f"Model saved to {training_args.output_dir}")
 
-    # Save everything else on main process
-    if trainer.accelerator.is_main_process:
-        # Restore k,v cache for fast inference
-        trainer.model.config.use_cache = True
-        trainer.model.config.save_pretrained(training_args.output_dir)
+        # Save everything else on main process
+        if trainer.accelerator.is_main_process:
+            # Restore k,v cache for fast inference
+            trainer.model.config.use_cache = True
+            trainer.model.config.save_pretrained(training_args.output_dir)
     
     ##########
     # Evaluate
@@ -299,9 +313,11 @@ def main():
         # trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     
-    # # >>>>> add a breakpoint for debug? <<<<<
-    # torch.distributed.breakpoint(rank=0)
+    # >>>>> add a breakpoint for debug? <<<<<
+    torch.distributed.breakpoint(rank=0)
     
+    
+    # Finally, destroy process group
     try:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
