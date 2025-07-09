@@ -262,7 +262,11 @@ class ScriptArguments:
             "'trace'."
         },
     )
-
+    seed: int = field(
+        default=None, 
+        metadata={"help": "Random seed to use for the generation."}
+    )
+    
     
     def to_json_string(self):
         """
@@ -289,6 +293,7 @@ def llm_worker(
         gpu_memory_utilization=script_args.gpu_memory_utilization,
         enforce_eager=script_args.enforce_eager,
         dtype=script_args.dtype,
+        seed=script_args.seed,
         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
         # This is particularly useful here because we generate completions from the same prompts.
