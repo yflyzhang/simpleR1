@@ -34,13 +34,24 @@ class ScriptArguments:
     #     metadata={"help": "Dataset name."}
     # )
     
-    train_dataset_name: str = field(
+    # train_dataset_name: str = field(
+    #     default=None,
+    #     metadata={"help": "Train dataset name."},
+    # )
+    # eval_dataset_name: Optional[str] = field(
+    #     default=None,
+    #     metadata={"help": "Test dataset name."},
+    # )
+
+    train_dataset_name: list[str] = field(
         default=None,
-        metadata={"help": "Train dataset name."},
+        # default_factory=lambda: [], 
+        metadata={"help": "The list of train dataset names to run."},
     )
-    eval_dataset_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "Test dataset name."},
+    
+    eval_dataset_name: list[str] = field(
+        default_factory=lambda: [], 
+        metadata={"help": "The list of eval/test dataset names to run."}
     )
     
     dataset_config: Optional[str] = field(
@@ -64,15 +75,27 @@ class ScriptArguments:
             "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992."
         },
     )
-
+    
+    # Deprecated parameter, use `num_train_samples_per_dataset` instead
     max_num_train_samples: int = field(
-        default=-1,
-        metadata={"help": "Max number of samples used for training."},
+        default=None,
+        metadata={"help": "Max number of samples used per dataset for training."},
     )
     
+    # Deprecated parameter, use `num_eval_samples_per_dataset` instead
     max_num_test_samples: int = field(
         default=None,
-        metadata={"help": "Max number of samples used for test."},
+        metadata={"help": "Max number of samples used per dataset for eval/test."},
+    )
+    
+    num_train_samples_per_dataset: int = field(
+        default=None,
+        metadata={"help": "Max number of samples used per dataset for training."},
+    )
+    
+    num_test_samples_per_dataset: int = field(
+        default=None,
+        metadata={"help": "Max number of samples used per dataset for eval/test."},
     )
 
     check_gpu_idle: bool = field(

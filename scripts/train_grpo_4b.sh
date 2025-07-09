@@ -13,7 +13,8 @@ model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
 
-model_name_or_path=Qwen/Qwen3-4B
+model_name_or_path=Qwen/Qwen3-4B-Base
+# model_name_or_path=Qwen/Qwen3-4B
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -70,6 +71,7 @@ accelerate launch \
     --config_file configs/accelerate_configs/zero2.yaml \
     --num_processes=2 \
 src/run_grpo.py \
+    --do_train True \
     --config configs/grpo_config.yaml \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
@@ -84,10 +86,10 @@ src/run_grpo.py \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 1 \
-    --num_iterations 2 \
+    --num_iterations 3 \
     --torch_empty_cache_steps 1 \
-    --max_num_train_samples 2000 \
-    --max_num_test_samples -1 \
+    --num_train_samples_per_dataset 2000 \
+    --num_test_samples_per_dataset -1 \
     --max_completion_length 3072 \
     --max_eval_completion_length 4096 \
     --use_vllm True \

@@ -12,27 +12,19 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
-model_name_or_path=Qwen/Qwen3-1.7B
+# model_name_or_path=Qwen/Qwen3-1.7B
 
-# train_dataset=openai/gsm8k
-train_dataset=nlile/hendrycks-MATH-benchmark
-# train_dataset=meta-math/MetaMathQA
-# train_dataset=SynthLabsAI/Big-Math-RL-Verified
-# train_dataset=hiyouga/math12k
-# train_dataset=gneubig/aime-1983-2024
-# train_dataset=open-r1/OpenR1-Math-220k
-# train_dataset=agentica-org/DeepScaleR-Preview-Dataset
-# train_dataset=RUC-AIBOX/STILL-3-Preview-RL-Data
-# train_dataset=Maxwell-Jia/AIME_2024
+# model_name_or_path=Qwen/Qwen3-4B-Base
+model_name_or_path=Qwen/Qwen3-4B
 
-
-eval_dataset=HuggingFaceH4/MATH-500
-# eval_dataset=opencompass/AIME2025
+# Trained model
+model_name_or_path=outputs/models/Qwen3-4B_data-hendrycks-MATH-benchmark_date-2025-07-04/checkpoint-100
 
 
 model_name=$(basename $model_name_or_path)
-run_name=${model_name}_date-$(date +%Y-%m-%d)
-# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
+# run_name=$model_name-$(date +%Y-%m-%d)
+# run_name=${model_name}_data-$(basename $eval_dataset)_date-$(date +%Y-%m-%d)
+run_name=${model_name}_eval_date-$(date +%Y-%m-%d)
 
 
 OUTPUT_DIR=outputs/models/$run_name
@@ -69,54 +61,62 @@ accelerate launch \
     --config_file configs/accelerate_configs/ddp.yaml \
     --num_processes=2 \
 src/run_grpo.py \
-    --do_train True \
+    --do_eval True \
     --config configs/grpo_config.yaml \
     --output_dir $OUTPUT_DIR \
-    --check_gpu_idle True \
+    --check_gpu_idle False \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name nlile/hendrycks-MATH-benchmark openai/gsm8k \
     --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k opencompass/AIME2025 \
-    --num_train_epochs 1 \
-    --num_generations 20 \
-    --num_eval_generations 1 \
-    --per_device_train_batch_size 10 \
-    --per_device_eval_batch_size 128 \
-    --dynamic_sampling True \
-    --max_resample_attempts 3 \
-    --num_iterations 3 \
-    --torch_empty_cache_steps 1 \
-    --num_train_samples_per_dataset 2000 \
     --num_test_samples_per_dataset -1 \
-    --max_completion_length 2048 \
+    --num_eval_generations 2 \
+    --per_device_eval_batch_size 128 \
     --max_eval_completion_length 4096 \
     --use_vllm True \
-    --vllm_mode server \
+    --vllm_mode colocate \
+    --vllm_gpu_memory_utilization 0.8 \
     --vllm_server_host 0.0.0.0 \
     --vllm_server_port 8000 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
-    --loss_type bnpo \
-    --scale_rewards False \
     --mask_truncated_completions True \
-    --epsilon 0.2 \
-    --epsilon_high 0.3 \
-    --temperature 1.0 \
-    --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --lr_scheduler_type constant \
-    --learning_rate 3e-6 \
-    --save_strategy steps \
-    --save_steps 200 \
-    --eval_strategy steps \
-    --eval_steps 10 \
-    --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-train \
+    --wandb_project simpleR1-eval \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
 
 
+
+
+# accelerate launch \
+#     --main_process_port $MASTER_PORT \
+#     --config_file configs/accelerate_configs/zero3.yaml \
+#     --num_processes=2 \
+# src/run_grpo.py \
+#     --do_eval True \
+#     --config configs/grpo_config.yaml \
+#     --output_dir $OUTPUT_DIR \
+#     --check_gpu_idle True \
+#     --model_name_or_path $model_name_or_path \
+#     --eval_dataset_name $eval_dataset \
+#     --num_eval_generations 1 \
+#     --per_device_eval_batch_size 128 \
+#     --num_test_samples_per_dataset -1 \
+#     --max_eval_completion_length 4096 \
+#     --use_vllm True \
+#     --vllm_mode server \
+#     --vllm_server_host 0.0.0.0 \
+#     --vllm_server_port 8000 \
+#     --reward_funcs accuracy format tag \
+#     --reward_weights 8 1 1 \
+#     --mask_truncated_completions True \
+#     --eval_temperature 0.7 \
+#     --eval_top_p 0.95 \
+#     --log_level info \
+#     --wandb_project simpleR1-eval \
+#     --run_name $run_name \
+#     2>&1 | tee $LOG_FILE
 
 
