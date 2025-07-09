@@ -19,6 +19,11 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 - Compatible with Hugging Face TRL and open-r1 workflows and scripts.
 
 
+## Updates
+
+- **version 0.3.0.preview**:
+  - Add a simple dynamic sampling approach for generation.
+  - Support multiple datasets for training and evaluation.
 
 
 
@@ -43,6 +48,8 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 │   │
 │   ├── run_vllm_serve_1.7b.sh # Run a vllm server for 1.7b model
 │   ├── train_grpo_1.7b.sh     # Train a grpo 1.7b model
+│   │
+│   ├── eval_grpo_4b.sh        # Evaluate a 4b model
 │   └── ...         
 │           
 ├── src/                       # Python codes
@@ -184,7 +191,7 @@ cd simpleR1
 ```
 
 
-#### Example training command:
+### Example training command:
 
 1. For single-device training:
 
@@ -207,6 +214,7 @@ cd simpleR1
     >     --config_file configs/accelerate_configs/ddp.yaml \
     >     --num_processes=1 \
     > src/run_grpo.py \
+    >     --do_train True \
     >     --config configs/grpo_config.yaml \
     >     --output_dir $OUTPUT_DIR \
     >     --check_gpu_idle True \
@@ -280,7 +288,7 @@ cd simpleR1
     
     Step 2: Start the training pipeline while interacting with the vllm server
 
-    > Make sure `vllm_mode = server`.
+    > `vllm_mode = server` is recommended.
 
     ```bash
     bash scripts/train_grpo_3b.sh
@@ -296,6 +304,7 @@ cd simpleR1
     >     --config_file configs/accelerate_configs/zero2.yaml \
     >     --num_processes=2 \
     > src/run_grpo.py \
+    >     --do_train True \
     >     --config configs/grpo_config.yaml \
     >     --output_dir $OUTPUT_DIR \
     >     --model_name_or_path Qwen/Qwen2.5-3B \
@@ -342,14 +351,58 @@ cd simpleR1
     >     --log_level info \
     >     --wandb_project simpleR1-$(basename $train_dataset) \
     >     --run_name $run_name \
-    >     2>&1 | tee $LOG_FILE
+    >     2>&1 | tee train.log
     > ```
   
 
   > [!NOTE]
   > `run_vllm_serve_3b.sh` and `train_grpo_3b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
 
-    
+
+
+### Example evaluate command:
+
+We can simply reuse the code to evaluate without training the model.
+
+
+  ```bash
+  bash scripts/eval_grpo_4b.sh
+  ```
+
+  > Or override additional parameters via command line. For example,
+  > ```bash
+  > # export HF_HOME=/xxx/xxx/.cache/huggingface
+  > export CUDA_VISIBLE_DEVICES=0,1
+  > accelerate launch \
+  >   --main_process_port $MASTER_PORT \
+  >   --config_file configs/accelerate_configs/ddp.yaml \
+  >   --num_processes=2 \
+  > src/run_grpo.py \
+  >   --do_eval True \
+  >   --config configs/grpo_config.yaml \
+  >   --output_dir $OUTPUT_DIR \
+  >   --check_gpu_idle False \
+  >   --model_name_or_path $model_name_or_path \
+  >   --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k opencompass/AIME2025 \
+  >   --num_eval_generations 2 \
+  >   --per_device_eval_batch_size 128 \
+  >   --max_eval_completion_length 4096 \
+  >   --use_vllm True \
+  >   --vllm_mode colocate \
+  >   --vllm_gpu_memory_utilization 0.8 \
+  >   --reward_funcs accuracy format tag \
+  >   --reward_weights 8 1 1 \
+  >   --mask_truncated_completions True \
+  >   --eval_temperature 0.7 \
+  >   --eval_top_p 0.95 \
+  >   --log_level info \
+  >   --wandb_project simpleR1-eval \
+  >   --run_name $run_name \
+  >   2>&1 | tee eval.log
+  >  ```
+
+
+
 ## Dependencies
 See `requirements.txt` for a full list, but generally you don't need to install all of them. <br>
 Key dependencies include and can be installed as follows:

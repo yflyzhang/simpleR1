@@ -1288,8 +1288,10 @@ class GRPOTrainer(Trainer):
                 # (b) unique-sample-level mean/min/max
                 reshaped = all_completions_length.float().view(-1, num_generations)
                 self._metrics[mode]["completions/mean_length"].extend(reshaped.mean(-1).tolist())
-                self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
-                self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
+                if num_generations > 1:
+                    # two or more generations: min/max
+                    self._metrics[mode]["completions/min_length"].extend(reshaped.min(-1).values.tolist())
+                    self._metrics[mode]["completions/max_length"].extend(reshaped.max(-1).values.tolist())
                 
                 # 5. Ratio of truncated sequences (completions without EOS token).
                 # Note: `eos_idx` is equal to `max_completion_length` for completions with EOS token.
