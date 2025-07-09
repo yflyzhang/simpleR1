@@ -375,6 +375,7 @@ pip install wandb==0.20.1
 ## Issues
 - Extracting and comparing the answers are not easy. <br>
   For example, when the ground truth is `\boxed{\pi}` and the model outputs `pi` or `π`, the accuracy should be 1, but the current implementation (mainly due to `math-verify`) didn't consider them as equal.
+- In general, the aggregate reward is the weighted sum of each specific rewards. But when some constraints are applied, for example `mask_truncated_completions` is enabled, the aggregate reward may be smaller than the sum of each rewards as some of the rewards may be omitted.
 
 ## TODOs
 - LoRA is not supported yet.
