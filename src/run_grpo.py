@@ -110,33 +110,48 @@ def main():
         training_args.do_eval = True
     logger.info(f"do_train: {training_args.do_train}")
     logger.info(f"do_eval: {training_args.do_eval}")
+
+    # # >>>>> add a breakpoint for debug? <<<<<
+    # torch.distributed.breakpoint(rank=0)
     
     ##################
     # Load the dataset
     ##################
     system_prompt = training_args.system_prompt
-
+    
+    # Train datset: Combined to one if multiple datasets are provieded
     train_dataset = None
     if training_args.do_train and script_args.train_dataset_name:
-        train_dataset = get_dataset(
-            script_args.train_dataset_name, split='train', system_prompt=system_prompt
-        )
-        # Note: Can use a small dataset for fast check.
-        # Make sure it's called after data preprocessing
-        if script_args.max_num_train_samples is not None and script_args.max_num_train_samples > 0:
-            num_samples = min(script_args.max_num_train_samples, len(train_dataset))
-            sample_ids = random.sample(range(len(train_dataset)), num_samples)
-            train_dataset = train_dataset.select(sample_ids)    
+        with training_args.main_process_first(desc="Train dataset pre-processing"):
+            train_dataset = get_dataset(
+                script_args.train_dataset_name, 
+                split='train', 
+                num_samples_per_dataset=script_args.num_train_samples_per_dataset,
+                system_prompt=system_prompt
+            )
+            # Find the common columns across all datasets
+            all_features = [set(dataset.column_names) for k, dataset in train_dataset.items()]
+            common_features = set.intersection(*all_features)
+            # Combine datasets into one based on common features
+            aligned_datasets = [dataset.select_columns(common_features) for k, dataset in train_dataset.items()]
+            # combined_dataset = datasets.concatenate_datasets(aligned_datasets)
+            train_dataset = datasets.concatenate_datasets(aligned_datasets)
     
+    # Eval dataset: May contain multiple datasets as a dict of `Dataset`
     eval_dataset = None
     if training_args.do_eval and script_args.eval_dataset_name:
-        eval_dataset = get_dataset(
-            script_args.eval_dataset_name, split='test', system_prompt=system_prompt
-        )
-        if script_args.max_num_test_samples is not None and script_args.max_num_test_samples > 0:
-            num_samples = min(script_args.max_num_test_samples, len(eval_dataset))
-            sample_ids = random.sample(range(len(eval_dataset)), num_samples)
-            eval_dataset = eval_dataset.select(sample_ids)
+        with training_args.main_process_first(desc="Eval dataset pre-processing"):
+            if len(script_args.eval_dataset_name) == 1:
+                # Single eval dataset
+                logger.info(f"Use the single eval dataset directly: {script_args.eval_dataset_name[0]}, instead of a dict of eval datasets")
+                script_args.eval_dataset_name = script_args.eval_dataset_name[0]
+            # Get eval datasets
+            eval_dataset = get_dataset(
+                script_args.eval_dataset_name, 
+                split='test', 
+                num_samples_per_dataset=script_args.num_test_samples_per_dataset,
+                system_prompt=system_prompt
+            )
     
     # # >>>>> add a breakpoint for debug? <<<<<
     # torch.distributed.breakpoint(rank=0)
@@ -309,7 +324,7 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(eval_dataset)
+        # metrics["eval_samples"] = len(eval_dataset)
         # trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     

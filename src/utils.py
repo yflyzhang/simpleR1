@@ -2,6 +2,7 @@ import os
 import contextlib
 import functools
 import time
+import random
 from typing import Generator
 from transformers import (
     AutoTokenizer, 
@@ -83,9 +84,21 @@ def get_tokenizer(
 # Get train/eval dataset
 ########################
 
-def get_dataset(dataset_name, split='train', system_prompt=None):
-
-     # Check if the input is a local file or directory
+def get_dataset(
+    dataset_name,                   # Name of the dataset. Can be a single dataset or a list of datasets.
+    # *,                              # Arguments after this are keyword-only (no positional arguments allowed)
+    split='train',                  # Data split, e.g., 'train' or 'test'
+    num_samples_per_dataset=None,   # Number of max samples used per dataset
+    system_prompt=None,             # System prompt
+):
+    
+    # Handle multiple datasets
+    # Convert list of dataset names to dict of `Dataset` if necessary
+    if isinstance(dataset_name, list):
+        datasets = {name: get_dataset(name, split, num_samples_per_dataset, system_prompt) for name in dataset_name}
+        return datasets
+    
+    # Check if the input is a local file or directory
     if os.path.exists(dataset_name):
         print(f"Loading local dataset from: {dataset_name}")
         # Load local dataset
@@ -103,6 +116,7 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
             dataset = load_dataset(dataset_name, name='AIME2025-I', split=split)
         else:
             dataset = load_dataset(dataset_name, split=split)
+        # TODO: add support for other datasets accordingly
     
     columns = dataset.column_names
     
@@ -130,10 +144,8 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
     # Format into conversation
     def make_conversation(example):
         prompt = []
-        
         if system_prompt is not None:
             prompt.append({"role": "system", "content": system_prompt})
-        
         prompt.append({"role": "user", "content": example["problem"]})
         return {"prompt": prompt}
     
@@ -141,6 +153,14 @@ def get_dataset(dataset_name, split='train', system_prompt=None):
     
     # if "messages" in dataset.column_names:
     #     dataset = dataset.remove_columns("messages")
+    
+    # Chose a sample (by `num_samples_per_dataset`) from the dataset
+    # Note: Can use a small dataset for fast check. Can change the random strategy accordingly.
+    # Make sure it's called after data preprocessing.
+    if num_samples_per_dataset is not None and num_samples_per_dataset > 0:
+        num_samples = min(num_samples_per_dataset, len(dataset))
+        sample_ids = random.sample(range(len(dataset)), num_samples)
+        dataset = dataset.select(sample_ids)
     
     return dataset
 

@@ -1524,7 +1524,8 @@ class GRPOTrainer(Trainer):
         self, 
         logs: dict[str, float], 
         mode: str,
-        start_time: Optional[float] = None
+        metric_key_prefix: str = 'eval',
+        start_time: Optional[float] = None,
     ) -> None:
         r"""
         Log `logs` on the various objects watching training.
@@ -1538,6 +1539,11 @@ class GRPOTrainer(Trainer):
         Args:
             logs (`dict[str, float]`):
                 The values to log.
+            mode (`str`):
+                The training mode (e.g. `train`, `eval`).
+            metric_key_prefix (`str`):
+                The prefix to be used as the metrics key prefix (e.g. `eval`, `eval_gsm8k`). 
+                For example the metrics "bleu" will be named "eval_bleu" if the prefix is "eval"                
             start_time (`Optional[float]`):
                 The start of training.
         
@@ -1561,8 +1567,13 @@ class GRPOTrainer(Trainer):
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
-        
+            # metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            metrics = {f"{metric_key_prefix}_{key}": val for key, val in metrics.items()}
+        # Note: 
+        # No need to add the prefix "train_" to the keys in `metrics` since the `rewrite_logs` in `on_log` (callbacks) will do it for us.
+        # Ref: `rewrite_logs`
+        # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/integrations/integration_utils.py#L630
+                
         logs = {**logs, **metrics}      # raw logs + grpo metrics
         # output = {**logs, **metrics}    # raw logs + grpo metrics
         
@@ -1593,253 +1604,18 @@ class GRPOTrainer(Trainer):
             )
             # Log the DataFrame as a wandb.Table
             # Note: call `callback_handler.on_log` before wandb.log to make sure wandb is initialized
-            wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
+            if mode == "train":
+                # Need to add the prefix (i.e., 'train_') for completions since we are not using `on_log: rewrite_logs`
+                # Add more more specific prefix when necessary
+                wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
+            else:
+                # Support completions for multiple eval datasets
+                wandb.log({f"{metric_key_prefix}_completions": wandb.Table(dataframe=df)})
         
         # Reset `_metrics` and `_completion_examples` buffers
         self._metrics[mode].clear()
         self._completion_examples[mode].clear()
-        
-    
-    def evaluate(
-        self,
-        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
-        ignore_keys: Optional[list[str]] = None,
-        metric_key_prefix: str = "eval",
-    ) -> dict[str, float]:
-        r"""
-        Run evaluation and returns metrics.
-        
-        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
-        (pass it to the init `compute_metrics` argument).
 
-        You can also subclass and override this method to inject custom behavior.
-
-        Args:
-            eval_dataset (Union[`Dataset`, dict[str, `Dataset`]), *optional*):
-                Pass a dataset if you wish to override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns
-                not accepted by the `model.forward()` method are automatically removed. If it is a dictionary, it will
-                evaluate on each dataset, prepending the dictionary key to the metric name. Datasets must implement the
-                `__len__` method.
-
-                <Tip>
-
-                If you pass a dictionary with names of datasets as keys and datasets as values, evaluate will run
-                separate evaluations on each dataset. This can be useful to monitor how training affects other
-                datasets or simply to get a more fine-grained evaluation.
-                When used with `load_best_model_at_end`, make sure `metric_for_best_model` references exactly one
-                of the datasets. If you, for example, pass in `{"data1": data1, "data2": data2}` for two datasets
-                `data1` and `data2`, you could specify `metric_for_best_model="eval_data1_loss"` for using the
-                loss on `data1` and `metric_for_best_model="eval_data2_loss"` for the loss on `data2`.
-
-                </Tip>
-
-            ignore_keys (`list[str]`, *optional*):
-                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
-                gathering predictions.
-            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
-                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
-                "eval_bleu" if the prefix is "eval" (default)
-
-        Returns:
-            A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
-            dictionary also contains the epoch number which comes from the training state.
-        
-        Ref:
-            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4086
-            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
-        """
-        
-        mode = 'eval'
-        self.mode = mode
-        
-        # handle multipe eval datasets
-        # TODO: add support for list of eval datasets
-        override = eval_dataset is not None
-        eval_dataset = eval_dataset if override else self.eval_dataset
-        if isinstance(eval_dataset, dict):
-            metrics = {}
-            for eval_dataset_name, _eval_dataset in eval_dataset.items():
-                dataset_metrics = self.evaluate(
-                    eval_dataset=_eval_dataset if override else eval_dataset_name,
-                    ignore_keys=ignore_keys,
-                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
-                )
-                metrics.update(dataset_metrics)
-            return metrics
-        
-        # memory metrics - must set up as early as possible
-        self._memory_tracker.start()
-        
-        dataloader = self.get_eval_dataloader(eval_dataset)
-        if self.is_fsdp_xla_v2_enabled:
-            dataloader = tpu_spmd_dataloader(dataloader)
-        
-        start_time = time.time()
-        
-        # `evaluation_loop`
-        # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L4205
-        description="Evaluation"
-        args = self.args
-        
-        # TODO: This can be deleted if use vllm. Reserved here for backward compatibility.
-        # if not self.use_vllm:
-        # if eval is called w/o train, handle model prep here
-        if self.is_deepspeed_enabled and self.deepspeed is None:
-            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
-            
-        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
-        
-        if len(self.accelerator._models) == 0 and model is self.model:
-            start_time = time.time()
-            model = (
-                self.accelerator.prepare(model)
-                if self.is_deepspeed_enabled or (self.is_fsdp_enabled and self.accelerator.mixed_precision != "fp8")
-                else self.accelerator.prepare_model(model, evaluation_mode=True)
-            )
-            self.model_preparation_time = round(time.time() - start_time, 4)
-
-            if self.is_fsdp_enabled:
-                self.model = model
-
-            # for the rest of this function `model` is the outside model, whether it was wrapped or not
-            if model is not self.model:
-                self.model_wrapped = model
-
-            # backward compatibility
-            if self.is_deepspeed_enabled:
-                self.deepspeed = self.model_wrapped
-        
-        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
-        # while ``train`` is running, cast it to the right dtype first and then put on device
-        if not self.is_in_train:
-            if args.fp16_full_eval:
-                model = model.to(dtype=torch.float16, device=args.device)
-            elif args.bf16_full_eval:
-                model = model.to(dtype=torch.bfloat16, device=args.device)
-        
-        # batch_size = self.args.eval_batch_size
-        effective_batch_size = self.args.per_device_eval_batch_size * self.accelerator.num_processes
-        logger.info("\n\n\n***** Evaluate *****")
-        logger.info(f"***** Running {description} *****")
-        if has_length(dataloader):
-            num_examples = self.num_examples(dataloader)
-            logger.info(f"  Num examples (raw) = {num_examples}")
-        else:
-            logger.info("  Num examples: Unknown")
-        logger.info(f"  Num generations = {self.num_eval_generations}")
-        # logger.info(f"  Batch size = {batch_size}")
-        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_eval_batch_size}")
-        logger.info(f"  Total eval batch size = {effective_batch_size}")
-        if has_length(dataloader):
-            num_update_steps_per_epoch = math.ceil(num_examples * self.num_eval_generations / effective_batch_size)
-            logger.info(f"  Num updates per epoch (ceiled) = {num_update_steps_per_epoch}")
-        logger.info(f"  Max completion length  = {self.max_eval_completion_length}")
-
-        model.eval()
-        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
-            self.optimizer.eval()
-        
-        self.callback_handler.eval_dataloader = dataloader
-        # Do this before wrapping.
-        eval_dataset = getattr(dataloader, "dataset", None)
-
-        if args.past_index >= 0:
-            self._past = None
-        
-        # Initialize containers/metrics
-        metrics = {}
-        
-        # Main evaluation loop
-        for step, inputs in enumerate(dataloader):
-            
-            # Prediction step: prepare grpo inputs
-            # Ref: self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            #   https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4487
-            
-            # Generate, score, and log completions in eval mode
-
-            # 1. Generate completions: augment inputs with generated completions
-            processed_inputs = self._generate_completions(inputs, mode='eval')
-            # 2. Score completions: get rewards for each completion
-            all_rewards_per_func, all_rewards, all_advantages = self._score_completions(processed_inputs, mode='eval')
-            # 3. Log completions
-            self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='eval')
-            
-            # TODO: Add `on_prediction_begin` before `on_prediction_step`?
-            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
-            # Ref: ProgressCallback.on_prediction_step
-            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
-            
-            del inputs, processed_inputs
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        # Remove redundant eval samples (in main process only)
-        # Note: This is important for the eval metrics for multi-device eval.
-        # Example:
-        #   Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
-        #   if eval batch size is set to be 5, then we will have two batches: 
-        #   [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
-        #   We need to remove the redundant samples in the last batch.
-        if self.accelerator.is_main_process:
-            num_total_samples = num_examples * self.num_eval_generations    # raw samples * generations
-            num_returned_samples = num_update_steps_per_epoch * effective_batch_size    # samples returned to complete the last batch
-            num_redundants = num_returned_samples - num_total_samples
-            
-            # Remove redundant samples due to the last data batch
-            if num_redundants > 0:
-                # Note: `num_examples` is the number of raw examples in the dataset
-                # {k:len(v) for k,v in self._metrics[mode].items()}
-                new_dic = {k:v[:num_examples] for k,v in self._metrics[mode].items()}
-                self._metrics[mode].update(new_dic)     # update eval dict
-                
-                # Filter the last batch only since it may contain redundant samples
-                self._completion_examples[mode][-1] = {k:v[:-num_redundants] for k,v in self._completion_examples[mode][-1].items()}
-                # {k:len(v) for k,v in self._completion_examples[mode][-1].items()}
-                # Note: `_completion_examples` is the list of batched results
-        
-        # After all calls to `.gather_function`, reset to `gather_for_metrics`:
-        self.gather_function = self.accelerator.gather_for_metrics
-        if args.past_index and hasattr(self, "_past"):
-            # Clean the state at the end of the evaluation loop
-            delattr(self, "_past")
-        
-        # total_batch_size = self.args.eval_batch_size * self.args.world_size
-        # metrics.update(
-        #     speed_metrics(
-        #         metric_key_prefix,
-        #         start_time,
-        #         num_samples=num_samples,
-        #         num_steps=math.ceil(num_samples / total_batch_size),
-        #     )
-        # )
-        
-        # log/print eval metrics
-        if self.accelerator.is_main_process:
-            # mode = 'eval'
-            metrics['global_step'] = self.state.global_step
-            # Prefix all keys with metric_key_prefix + '_'
-            for k, vals in self._metrics[mode].items():
-                if not k.startswith(f"{metric_key_prefix}_"):
-                    k = f"{metric_key_prefix}_{k}"
-                metrics[k] = np.mean(vals)
-            
-            print('\n\n')
-            self.log_metrics(mode, metrics)
-            # Note: To save the best model checkpoint in terms of accuracy, i.e., `save_strategy` is best,
-            # 'args.metric_for_best_model' can be set to 'xxx/accuracy_reward'.
-        
-        
-        # Log `_metrics` and `_completion_examples` (in wandb or other logging systems)
-        # self.log(metrics)
-        self.log({}, mode='eval')
-        
-        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)       
-        
-        self._memory_tracker.stop_and_update_metrics(metrics)
-        
-        return metrics
-    
     
     def train(
         self,
@@ -2518,4 +2294,264 @@ class GRPOTrainer(Trainer):
             self._deactivate_neftune(self.model)
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
+    
+    
+    def evaluate(
+        self,
+        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float]:
+        r"""
+        Run evaluation and returns metrics.
+        
+        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
+        (pass it to the init `compute_metrics` argument).
+
+        You can also subclass and override this method to inject custom behavior.
+
+        Args:
+            eval_dataset (Union[`Dataset`, dict[str, `Dataset`]), *optional*):
+                Pass a dataset if you wish to override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns
+                not accepted by the `model.forward()` method are automatically removed. If it is a dictionary, it will
+                evaluate on each dataset, prepending the dictionary key to the metric name. Datasets must implement the
+                `__len__` method.
+
+                <Tip>
+
+                If you pass a dictionary with names of datasets as keys and datasets as values, evaluate will run
+                separate evaluations on each dataset. This can be useful to monitor how training affects other
+                datasets or simply to get a more fine-grained evaluation.
+                When used with `load_best_model_at_end`, make sure `metric_for_best_model` references exactly one
+                of the datasets. If you, for example, pass in `{"data1": data1, "data2": data2}` for two datasets
+                `data1` and `data2`, you could specify `metric_for_best_model="eval_data1_loss"` for using the
+                loss on `data1` and `metric_for_best_model="eval_data2_loss"` for the loss on `data2`.
+
+                </Tip>
+
+            ignore_keys (`list[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
+                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
+                "eval_bleu" if the prefix is "eval" (default)
+
+        Returns:
+            A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
+            dictionary also contains the epoch number which comes from the training state.
+        
+        Ref:
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4086
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4254
+        """
+        
+        mode = 'eval'
+        self.mode = mode
+        
+        # debug(0)
+
+        # Handle multipe eval datasets
+        override = eval_dataset is not None
+        eval_dataset = eval_dataset if override else self.eval_dataset
+        if isinstance(eval_dataset, dict):
+            metrics = {}
+            for eval_dataset_name, _eval_dataset in eval_dataset.items():
+                # print(f"Evaluating {eval_dataset_name}")
+                dataset_metrics = self.evaluate(
+                    eval_dataset=_eval_dataset if override else eval_dataset_name,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                )
+                metrics.update(dataset_metrics)
+            return metrics
+        
+        # debug(0)
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+        
+        dataloader = self.get_eval_dataloader(eval_dataset)
+        # Ref: https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L1078
+        # eval_dataset: Optional[Union[str, Dataset]] = None
+        # If a `str`, will use `self.eval_dataset[eval_dataset]` as the evaluation dataset. 
+        # If a `Dataset`, will override `self.eval_dataset` and must implement `__len__`. 
+        # If it is a [`~datasets.Dataset`], columns not accepted by the `model.forward()` method are automatically removed.
+        
+        if self.is_fsdp_xla_v2_enabled:
+            dataloader = tpu_spmd_dataloader(dataloader)
+        
+        start_time = time.time()
+        
+        # `evaluation_loop`
+        # Ref: https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer.py#L4205
+        args = self.args
+        
+        # TODO: This can be deleted if use vllm. Reserved here for backward compatibility.
+        # if not self.use_vllm:
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.deepspeed is None:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
+            
+        model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+        
+        if len(self.accelerator._models) == 0 and model is self.model:
+            start_time = time.time()
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled or (self.is_fsdp_enabled and self.accelerator.mixed_precision != "fp8")
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+            self.model_preparation_time = round(time.time() - start_time, 4)
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
+        
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+        
+        # batch_size = self.args.eval_batch_size
+        effective_batch_size = self.args.per_device_eval_batch_size * self.accelerator.num_processes
+        if isinstance(eval_dataset, str):
+            # show the eval dataset name
+            logger.info(f"\n\n\n***** Evaluate '{eval_dataset}' *****")
+        else:
+            logger.info(f"\n\n\n***** Evaluate *****")
+
+        logger.info(f"***** Running Evaluation *****")
+        if has_length(dataloader):
+            num_examples = self.num_examples(dataloader)
+            logger.info(f"  Num examples (raw) = {num_examples}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Num generations = {self.num_eval_generations}")
+        # logger.info(f"  Batch size = {batch_size}")
+        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_eval_batch_size}")
+        logger.info(f"  Total eval batch size = {effective_batch_size}")
+        if has_length(dataloader):
+            num_update_steps_per_epoch = math.ceil(num_examples * self.num_eval_generations / effective_batch_size)
+            logger.info(f"  Num updates per epoch (ceiled) = {num_update_steps_per_epoch}")
+        logger.info(f"  Max completion length  = {self.max_eval_completion_length}")
+
+        model.eval()
+        if hasattr(self.optimizer, "eval") and callable(self.optimizer.eval):
+            self.optimizer.eval()
+        
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = getattr(dataloader, "dataset", None)
+
+        if args.past_index >= 0:
+            self._past = None
+        
+        # Initialize containers/metrics
+        metrics = {}
+        
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            
+            # Prediction step: prepare grpo inputs
+            # Ref: self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            #   https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer.py#L4487
+            
+            # Generate, score, and log completions in eval mode
+
+            # 1. Generate completions: augment inputs with generated completions
+            processed_inputs = self._generate_completions(inputs, mode='eval')
+            # 2. Score completions: get rewards for each completion
+            all_rewards_per_func, all_rewards, all_advantages = self._score_completions(processed_inputs, mode='eval')
+            # 3. Log completions
+            self._log_completions(processed_inputs, all_rewards_per_func, all_rewards, mode='eval')
+            
+            # TODO: Add `on_prediction_begin` before `on_prediction_step`?
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+            # Ref: ProgressCallback.on_prediction_step
+            # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/trainer_callback.py#L656
+            
+            del inputs, processed_inputs
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        # Remove redundant eval samples (in main process only)
+        # Note: This is important for the eval metrics for multi-device eval.
+        # Example:
+        #   Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
+        #   if eval batch size is set to be 5, then we will have two batches: 
+        #   [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
+        #   We need to remove the redundant samples in the last batch.
+        if self.accelerator.is_main_process:
+            num_total_samples = num_examples * self.num_eval_generations    # raw samples * generations
+            num_returned_samples = num_update_steps_per_epoch * effective_batch_size    # samples returned to complete the last batch
+            num_redundants = num_returned_samples - num_total_samples
+            
+            # Remove redundant samples due to the last data batch
+            if num_redundants > 0:
+                # Note: `num_examples` is the number of raw examples in the dataset
+                # {k:len(v) for k,v in self._metrics[mode].items()}
+                new_dic = {k:v[:num_examples] for k,v in self._metrics[mode].items()}
+                self._metrics[mode].update(new_dic)     # update eval dict
+                
+                # Filter the last batch only since it may contain redundant samples
+                self._completion_examples[mode][-1] = {k:v[:-num_redundants] for k,v in self._completion_examples[mode][-1].items()}
+                # {k:len(v) for k,v in self._completion_examples[mode][-1].items()}
+                # Note: `_completion_examples` is the list of batched results
+        
+        # After all calls to `.gather_function`, reset to `gather_for_metrics`:
+        self.gather_function = self.accelerator.gather_for_metrics
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+        
+        # total_batch_size = self.args.eval_batch_size * self.args.world_size
+        # metrics.update(
+        #     speed_metrics(
+        #         metric_key_prefix,
+        #         start_time,
+        #         num_samples=num_samples,
+        #         num_steps=math.ceil(num_samples / total_batch_size),
+        #     )
+        # )
+        
+        # log/print eval metrics
+        if self.accelerator.is_main_process:
+            # mode = 'eval'
+            metrics['global_step'] = self.state.global_step
+            # metrics[f"{metric_key_prefix}"] = metric_key_prefix
+            metrics[f"{metric_key_prefix}_num_samples"] = len(eval_dataset)
+            # Prefix all keys with metric_key_prefix + '_'
+            for k, vals in self._metrics[mode].items():
+                if not k.startswith(f"{metric_key_prefix}_"):
+                    k = f"{metric_key_prefix}_{k}"
+                metrics[k] = np.mean(vals)
+            
+            print('\n\n')
+            self.log_metrics(mode, metrics)     # print the results
+            # self.log_metrics(metric_key_prefix, metrics)     # print the results
+            # Note: To save the best model checkpoint in terms of accuracy, i.e., `save_strategy` is best,
+            # 'args.metric_for_best_model' can be set to 'xxx/accuracy_reward'.
+            print('\n\n')
+
+        # debug(0)
+        
+        # Log `_metrics` and `_completion_examples` (in wandb or other logging systems)
+        # self.log(metrics)
+        self.log({}, mode='eval', metric_key_prefix=metric_key_prefix)
+        
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)       
+        
+        self._memory_tracker.stop_and_update_metrics(metrics)
+        
+        return metrics
     
