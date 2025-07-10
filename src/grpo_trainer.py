@@ -1565,12 +1565,15 @@ class GRPOTrainer(Trainer):
         # mode = self.mode
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
         # Note: averaged over unique-samples, so max/min completion length means the averaged value across unique-samples.
-        
+
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
+            # metrics['global_step'] = self.state.global_step     # add global_step for eval
+            if metric_key_prefix.startswith('eval/'):
+                key_prefix = metric_key_prefix.replace('eval/', 'eval_')
             # metrics = {f"eval_{key}": val for key, val in metrics.items()}
-            metrics = {f"{metric_key_prefix}_{key}": val for key, val in metrics.items()}
+            metrics = {f"{key_prefix}/{key}": val for key, val in metrics.items()}
         # Note: 
         # No need to add the prefix "train_" to the keys in `metrics` since the `rewrite_logs` in `on_log` (callbacks) will do it for us.
         # Ref: `rewrite_logs`
@@ -1609,10 +1612,13 @@ class GRPOTrainer(Trainer):
             if mode == "train":
                 # Need to add the prefix (i.e., 'train_') for completions since we are not using `on_log: rewrite_logs`
                 # Add more more specific prefix when necessary
-                wandb.log({f"{mode}_completions": wandb.Table(dataframe=df)})
+                wandb.log({f"{mode}_table/completions": wandb.Table(dataframe=df)})
             else:
                 # Support completions for multiple eval datasets
-                wandb.log({f"{metric_key_prefix}_completions": wandb.Table(dataframe=df)})
+                if metric_key_prefix.startswith('eval'):
+                    # insert '_table' to form 'eval_table/'
+                    key_prefix = metric_key_prefix[:4] + '_table' + metric_key_prefix[4:]
+                wandb.log({f"{key_prefix}/completions": wandb.Table(dataframe=df)})
         
         # Reset `_metrics` and `_completion_examples` buffers
         self._metrics[mode].clear()
@@ -2362,13 +2368,14 @@ class GRPOTrainer(Trainer):
                 dataset_metrics = self.evaluate(
                     eval_dataset=_eval_dataset if override else eval_dataset_name,
                     ignore_keys=ignore_keys,
-                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                    # metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                    metric_key_prefix=f"{metric_key_prefix}/{eval_dataset_name}",
                 )
                 metrics.update(dataset_metrics)
             return metrics
         
         # debug(0)
-
+        
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
         
@@ -2531,11 +2538,11 @@ class GRPOTrainer(Trainer):
             # mode = 'eval'
             metrics['global_step'] = self.state.global_step
             # metrics[f"{metric_key_prefix}"] = metric_key_prefix
-            metrics[f"{metric_key_prefix}_num_samples"] = len(eval_dataset)
-            # Prefix all keys with metric_key_prefix + '_'
+            metrics[f"{metric_key_prefix}/num_samples"] = len(eval_dataset)
+            # Prefix all keys with metric_key_prefix + '/'
             for k, vals in self._metrics[mode].items():
-                if not k.startswith(f"{metric_key_prefix}_"):
-                    k = f"{metric_key_prefix}_{k}"
+                if not k.startswith(f"{metric_key_prefix}/"):
+                    k = f"{metric_key_prefix}/{k}"
                 metrics[k] = np.mean(vals)
             
             print('\n\n')
