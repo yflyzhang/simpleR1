@@ -21,6 +21,16 @@ from tqdm.auto import tqdm
 from transformers.trainer_utils import has_length
 from transformers.trainer_callback import TrainerCallback
 
+
+###############################################
+# Custom ProgressCallback for Dynamic Sampling
+###############################################
+"""
+Progress callback to use with the Trainer class and customize the training loop.
+There will be two progress bars if this callback is used: 
+    - one for the data iteration,
+    - the other for the optimizer step.
+"""
 class GRPOProgressCallback(TrainerCallback):
     """
     A [`TrainerCallback`] that displays the progress of training or evaluation.

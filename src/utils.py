@@ -114,6 +114,9 @@ def get_dataset(
             dataset = load_dataset(dataset_name, name='main', split=split)
         elif dataset_name == 'opencompass/AIME2025':
             dataset = load_dataset(dataset_name, name='AIME2025-I', split=split)
+        elif dataset_name == 'HuggingFaceH4/aime_2024':
+            # Note: only train split is available for this dataset
+            dataset = load_dataset(dataset_name, split='train')
         else:
             dataset = load_dataset(dataset_name, split=split)
         # TODO: add support for other datasets accordingly

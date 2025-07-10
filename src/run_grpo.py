@@ -141,10 +141,10 @@ def main():
     eval_dataset = None
     if training_args.do_eval and script_args.eval_dataset_name:
         with training_args.main_process_first(desc="Eval dataset pre-processing"):
-            if len(script_args.eval_dataset_name) == 1:
-                # Single eval dataset
-                logger.info(f"Use the single eval dataset directly: {script_args.eval_dataset_name[0]}, instead of a dict of eval datasets")
-                script_args.eval_dataset_name = script_args.eval_dataset_name[0]
+            # Single eval dataset. Uncomment if you don't want to log the dataset name
+            # if len(script_args.eval_dataset_name) == 1:
+            #     logger.info(f"Use the single eval dataset directly: {script_args.eval_dataset_name[0]}, instead of a dict of eval datasets")
+            #     script_args.eval_dataset_name = script_args.eval_dataset_name[0]
             # Get eval datasets
             eval_dataset = get_dataset(
                 script_args.eval_dataset_name, 
