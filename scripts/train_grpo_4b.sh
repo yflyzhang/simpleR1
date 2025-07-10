@@ -13,8 +13,8 @@ model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
 
-model_name_or_path=Qwen/Qwen3-4B-Base
-# model_name_or_path=Qwen/Qwen3-4B
+# model_name_or_path=Qwen/Qwen3-4B-Base
+model_name_or_path=Qwen/Qwen3-4B
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -76,8 +76,8 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name $train_dataset \
-    --eval_dataset_name $eval_dataset \
+    --train_dataset_name nlile/hendrycks-MATH-benchmark gneubig/aime-1983-2024  \
+    --eval_dataset_name HuggingFaceH4/MATH-500 HuggingFaceH4/aime_2024 \
     --num_train_epochs 1 \
     --num_generations 14 \
     --num_eval_generations 1 \
@@ -90,7 +90,7 @@ src/run_grpo.py \
     --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 2000 \
     --num_test_samples_per_dataset -1 \
-    --max_completion_length 3072 \
+    --max_completion_length 3200 \
     --max_eval_completion_length 4096 \
     --use_vllm True \
     --vllm_mode server \
@@ -118,7 +118,7 @@ src/run_grpo.py \
     --eval_steps 10 \
     --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-test \
+    --wandb_project simpleR1-train \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 

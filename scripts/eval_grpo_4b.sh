@@ -66,7 +66,7 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle False \
     --model_name_or_path $model_name_or_path \
-    --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k opencompass/AIME2025 \
+    --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k HuggingFaceH4/aime_2024 \
     --num_test_samples_per_dataset -1 \
     --num_eval_generations 2 \
     --per_device_eval_batch_size 128 \
