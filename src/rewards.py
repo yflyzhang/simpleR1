@@ -52,7 +52,7 @@ from utils import is_messages
 
 
 
-def accuracy_reward(completions, solutions, **kwargs):
+def accuracy_reward(completions, solutions, answers, **kwargs):
     """
     Reward function that checks if the completion is the same as the ground truth.
     
@@ -91,11 +91,25 @@ def accuracy_reward(completions, solutions, **kwargs):
     if is_messages(completions[0]):     # message format
         completions = [example[0]["content"] for example in completions]
         # completions = [example["content"] for example in completions]
+    
+    # # Ground truth answers/solutions
+    # # 'answers' are preferred over 'solutions'
+    # if answers is not None:
+    #     ground_truth = answers
+    # elif solutions is not None:
+    #     ground_truth = solutions
+    # else:
+    #     raise ValueError("No ground truth provided! Please check the data.")
+    
     rewards = []
-    for completion_to_parse, gold_to_parse in zip(completions, solutions):
+    for completion_to_parse, answer_to_parse, solution_to_parse in zip(completions, answers, solutions):
         
-        # Parse gold/ground truth
-        gold_parsed = parse(gold_to_parse)
+        # Parse gold/ground truth from both answer and solution text
+        gold_parsed = []
+        if answer_to_parse is not None:
+            gold_parsed += parse(answer_to_parse)
+        if solution_to_parse is not None:
+            gold_parsed += parse(solution_to_parse)
         
         if len(gold_parsed) != 0:
             # Parse completion
@@ -135,9 +149,9 @@ def accuracy_reward(completions, solutions, **kwargs):
             # If the gold solution is not parseable,             
             # we reward 0 to skip this example
             reward = 0.0
-            logger.error(f"Failed to parse gold solution: {gold_to_parse}.")
+            logger.error(f"Failed to parse gold solution: {answer_to_parse=}, {solution_to_parse=}.")
         rewards.append(reward)
-
+        
         # # >>>>> add a breakpoint for debug? <<<<<
         # torch.distributed.breakpoint(rank=0)
 

@@ -121,29 +121,66 @@ def get_dataset(
             dataset = load_dataset(dataset_name, split=split)
         # TODO: add support for other datasets accordingly
     
+    # columns = dataset.column_names
+    
+    # # Check if 'problem' is in columns (may change it accordingly):
+    # if 'problem' not in columns:
+    #     for feature in columns:
+    #         # 'problem', 'query' can be considered as 'problem' column
+    #         # (may change or add columns accordingly)
+    #         if feature.lower() in ['question', 'problem', 'query']:
+    #             dataset = dataset.rename_column(feature, 'problem')
+    #             break
+    #     else:
+    #         raise ValueError("No column named 'problem' in the datset!")
+    
+    # # Check if 'solution' is in columns:
+    # if 'solution' not in columns:
+    #     for feature in columns:
+    #         # 'answer', 'response' can be considered as 'solution' column
+    #         if feature.lower() in ['answer', 'solution', 'response']:
+    #             dataset = dataset.rename_column(feature, 'solution')
+    #             break
+    #     else:
+    #         raise ValueError("No column named 'solution' in the datset!")
+    
+    # Lowercase column names
     columns = dataset.column_names
+    for feature in columns:
+        if not feature.lower() in columns:
+            dataset = dataset.rename_column(feature, feature.lower())
     
     # Check if 'problem' is in columns (may change it accordingly):
+    columns = dataset.column_names
     if 'problem' not in columns:
-        for feture in columns:
-            # 'problem', 'query' can be considered as 'problem' column
+        for feature in columns:
+            # 'question', 'query' can be treated as the 'problem' column
             # (may change or add columns accordingly)
-            if feture.lower() in ['question', 'problem', 'query']:
-                dataset = dataset.rename_column(feture, 'problem')
+            if feature.lower() in ['question', 'query']:
+                print(f"'{feature}' is renamed to 'problem'.")
+                dataset = dataset.rename_column(feature, 'problem')
                 break
         else:
-            raise ValueError("No column named 'problem' in the datset!")
+            raise ValueError(
+                "No column named 'problem' in the datset!"
+                "Please check the data and provide one."
+                "You may need to rename some columns to 'problem' to proceed."
+            )
     
-    # Check if 'solution' is in columns:
-    if 'solution' not in columns:
-        for feture in columns:
-            # 'answer', 'response' can be considered as 'solution' column
-            if feture.lower() in ['answer', 'solution', 'response']:
-                dataset = dataset.rename_column(feture, 'solution')
-                break
-        else:
-            raise ValueError("No column named 'solution' in the datset!")
-    
+    # Check if 'solution' and 'answer' are in columns 
+    columns = dataset.column_names
+    if 'solution' not in columns and 'answer' not in columns:
+        raise ValueError(
+            "No column named 'solution' or 'answer' in the datset!"
+            "Please check the data and provide one."
+            "You may need to rename some columns to 'solution' or 'answer' to proceed."
+        )
+    # Add a null column (as a placeholder) when necessary
+    for feature in ['solution', 'answer']:
+        if feature not in columns:
+            print(f"No column named '{feature}', add a null column of it as the placeholder.")
+            dataset = dataset.add_column(feature, [None] * len(dataset))
+
     # Format into conversation
     def make_conversation(example):
         prompt = []

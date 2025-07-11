@@ -436,7 +436,7 @@ class GRPOTrainer(Trainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
-        # Completion examples (e.g., prompt + solution + score) for wandb log
+        # Completion examples (e.g., problem + solution + answer + completion + score) for wandb log
         self._completion_examples = {"train": [], "eval": []}
         self.log_completions = args.log_completions
         
@@ -648,7 +648,7 @@ class GRPOTrainer(Trainer):
         # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
         # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
-            self._signature_columns = ["prompt", "problem", "solution"]
+            self._signature_columns = ["prompt", "problem", "solution", "answer"]
     
 
     def _get_train_sampler(self) -> Sampler:
@@ -914,7 +914,8 @@ class GRPOTrainer(Trainer):
         problems = [example["problem"] for example in inputs]   # raw problems
         prompts = [example["prompt"] for example in inputs]     # raw prompts
         solutions = [example["solution"] for example in inputs] # raw solutions
-
+        answers = [example["answer"] for example in inputs] # raw answers
+        
         # Apply chat template and tokenize
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
@@ -1068,6 +1069,7 @@ class GRPOTrainer(Trainer):
             # 1. text
             "problems": problems,
             "solutions": solutions,
+            "answers": answers,
             "prompts": prompts,
             "completions": completions,
             
@@ -1107,6 +1109,8 @@ class GRPOTrainer(Trainer):
         prompts = inputs['prompts']
         completions = inputs['completions']
         solutions = inputs['solutions']
+        answers = inputs['answers']
+        
         
         # Compute rewards
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
@@ -1139,7 +1143,7 @@ class GRPOTrainer(Trainer):
             else:
                 # Get each rule-based reward
                 output_reward_func = reward_func(
-                    prompts=prompts, completions=completions, solutions=solutions
+                    prompts=prompts, completions=completions, solutions=solutions, answers=answers
                 )
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         
@@ -1251,8 +1255,9 @@ class GRPOTrainer(Trainer):
                 maybe_apply_chat_template({'prompt': p}, self.processing_class)['prompt'] for p in prompts
             ]
         
-        # 2. Raw solution text (gold) (may change it to `answer`?)
+        # 2. Raw solution/answer text (gold if any)
         solutions_text = inputs['solutions']
+        answers_text = inputs['answers']
         
         # 3. Completion text (may extract from conversational message)
         if is_messages(completions[0]):
@@ -1308,6 +1313,7 @@ class GRPOTrainer(Trainer):
                 "global_step": [global_step] * len(all_completions_length),
                 "problem": gather_object(problems_text),
                 "solution": gather_object(solutions_text),
+                "answer": gather_object(answers_text),
                 "completion": gather_object(completion_texts),
                 "completion_length": all_completions_length.tolist(),
                 # "reward": all_rewards.tolist(),
@@ -1578,7 +1584,7 @@ class GRPOTrainer(Trainer):
         # No need to add the prefix "train_" to the keys in `metrics` since the `rewrite_logs` in `on_log` (callbacks) will do it for us.
         # Ref: `rewrite_logs`
         # https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/integrations/integration_utils.py#L630
-                
+        
         logs = {**logs, **metrics}      # raw logs + grpo metrics
         # output = {**logs, **metrics}    # raw logs + grpo metrics
         
@@ -1595,7 +1601,7 @@ class GRPOTrainer(Trainer):
         #       def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         #       https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/integrations/integration_utils.py#L957
         
-        # Log completion exmaples (i.e., prompt + solution + score) tables in main process
+        # Log completion exmaples (i.e., problem + solution + answer + completion + score) tables in main process
         if (
             self.accelerator.is_main_process and
             self.log_completions and 
