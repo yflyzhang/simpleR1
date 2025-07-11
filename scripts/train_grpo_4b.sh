@@ -88,7 +88,7 @@ src/run_grpo.py \
     --gradient_accumulation_steps 1 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
-    --num_train_samples_per_dataset 2000 \
+    --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 3200 \
     --max_eval_completion_length 4096 \
@@ -108,10 +108,10 @@ src/run_grpo.py \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
     --repetition_penalty 1.0 \
-    --beta 1e-6 \
+    --beta 1e-5 \
     --compute_kl True \
     --lr_scheduler_type constant \
-    --learning_rate 2e-6 \
+    --learning_rate 1e-6 \
     --save_strategy steps \
     --save_steps 100 \
     --eval_strategy steps \
