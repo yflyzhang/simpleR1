@@ -5,7 +5,7 @@ export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 export CUDA_VISIBLE_DEVICES=2
 
 python src/vllm_serve.py \
-    --model Qwen/Qwen3-4B \
+    --model Qwen/Qwen3-4B-Base \
     --seed 42 \
     --gpu_memory_utilization 0.9
 

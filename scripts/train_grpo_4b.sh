@@ -13,8 +13,8 @@ model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
 
-# model_name_or_path=Qwen/Qwen3-4B-Base
-model_name_or_path=Qwen/Qwen3-4B
+model_name_or_path=Qwen/Qwen3-4B-Base
+# model_name_or_path=Qwen/Qwen3-4B
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -35,6 +35,7 @@ eval_dataset=HuggingFaceH4/MATH-500
 model_name=$(basename $model_name_or_path)
 # run_name=$model_name-$(date +%Y-%m-%d)
 run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
+run_name=${model_name}_date-$(date +%Y-%m-%d)
 
 
 OUTPUT_DIR=outputs/models/$run_name

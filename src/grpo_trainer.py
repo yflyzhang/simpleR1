@@ -457,11 +457,9 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
         
-        # TODO: Use custom progress callback both for dynamic and non-dynamic sampling
-        # Dynamic sampling or not
+        # For dynamic sampling, use custom progress callback (`GRPOProgressCallback`) 
+        # instead of the native progress callback (`transformers.trainer_callback.ProgressCallback`)
         if self.dynamic_sampling:
-            # Remove `transformers.trainer_callback.ProgressCallback`,
-            # and add custom `GRPOProgressCallback`
             from transformers.trainer_callback import ProgressCallback
             self.callback_handler.pop_callback(ProgressCallback)
             self.callback_handler.add_callback(GRPOProgressCallback)
@@ -1353,8 +1351,6 @@ class GRPOTrainer(Trainer):
                 
                 # 6.continue Completion examples
                 completion_table["reward"] = all_rewards.tolist()
-                # if mode == 'eval':  # no 'mini_batch' in eval mode
-                #     del completion_table['mini_batch']
                 
                 # Append current examples to the global buffer: `_completion_examples`
                 self._completion_examples[mode].append(completion_table)
@@ -2066,9 +2062,10 @@ class GRPOTrainer(Trainer):
                             logger.info(f"\n  [{attempt=}]: Current model generation is not good, but max_attempts reached!")
                 
                 # 4. Dynamic sampling: Skip to the next batch if it's too easy/bad 
-                # Note: Change the logic here accordingly
+                # Note: May change the logic here accordingly. For example, accepts good completions only.
                 if self.dynamic_sampling:
                     if checkout in ['easy', 'bad']:
+                    # if checkout != 'good':    # accepts good completions only
                         # Note: Skip to the next batch. Only update progress_bar, while `global_step` remains unchanged!
                         # self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
