@@ -16,6 +16,9 @@ model_name_or_path=Qwen/Qwen2.5-3B
 model_name_or_path=Qwen/Qwen3-4B-Base
 # model_name_or_path=Qwen/Qwen3-4B
 
+# Trained model
+# model_name_or_path=outputs/models/Qwen3-4B-Base_data-hendrycks-MATH-benchmark_date-2025-07-12/checkpoint-200
+
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
 # train_dataset=meta-math/MetaMathQA
@@ -34,7 +37,7 @@ eval_dataset=HuggingFaceH4/MATH-500
 
 model_name=$(basename $model_name_or_path)
 # run_name=$model_name-$(date +%Y-%m-%d)
-run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
+# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 run_name=${model_name}_date-$(date +%Y-%m-%d)
 
 
@@ -110,7 +113,6 @@ src/run_grpo.py \
     --eval_top_p 0.95 \
     --repetition_penalty 1.0 \
     --beta 1e-5 \
-    --compute_kl True \
     --lr_scheduler_type constant \
     --learning_rate 1e-6 \
     --save_strategy steps \

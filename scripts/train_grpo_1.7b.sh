@@ -12,7 +12,11 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
-model_name_or_path=Qwen/Qwen3-1.7B
+model_name_or_path=Qwen/Qwen3-1.7B-Base
+# model_name_or_path=Qwen/Qwen3-1.7B
+
+# Trained model
+# model_name_or_path=outputs/models/Qwen3-1.7B-Base_date-2025-07-13/checkpoint-200
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -74,8 +78,8 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name nlile/hendrycks-MATH-benchmark openai/gsm8k \
-    --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k opencompass/AIME2025 \
+    --train_dataset_name nlile/hendrycks-MATH-benchmark \
+    --eval_dataset_name HuggingFaceH4/MATH-500 \
     --num_train_epochs 1 \
     --num_generations 20 \
     --num_eval_generations 1 \
@@ -104,6 +108,7 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
+    --beta 1e-5 \
     --lr_scheduler_type constant \
     --learning_rate 3e-6 \
     --save_strategy steps \
