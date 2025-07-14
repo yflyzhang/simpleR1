@@ -9,20 +9,21 @@ This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](ht
 
 The latest version includes an upgraded GRPO Trainer with a custom evaluate function for simultaneous training and evaluation, modularized model completion and reward score estimation.
 
-- Enhanced GRPO trainer with multi-iteration support, precise time estimation (tqdm), custom evaluate block, and wandb logging.
+- Enhanced GRPO trainer with multi-iteration support, more precise time estimation (tqdm), custom evaluate block, and wandb logging.
 
 - Modularized generate, score, and log for completions, enabling more user-defined controls.
 
-- Implementation of a simple reject sampling approach for generation.
+- Implementation of a simple reject sampling and dynamic sampling approach for generation.
 
-
-- Compatible with Hugging Face TRL and open-r1 workflows and scripts.
+- Evaluation on multiple benchmarks with/without training the model.
 
 
 ## Updates
 
-- **version 0.3.0.preview**:
-  - Add a simple dynamic sampling approach for generation.
+- **version 0.3.0**:
+  - Add a simple dynamic sampling approach for generation:
+    - Filter easy training samples.
+    - Resample hard training samples.
   - Support multiple datasets for training and evaluation.
 
 
@@ -49,7 +50,7 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 │   ├── run_vllm_serve_1.7b.sh # Run a vllm server for 1.7b model
 │   ├── train_grpo_1.7b.sh     # Train a grpo 1.7b model
 │   │
-│   ├── eval_grpo_4b.sh        # Evaluate a 4b model
+│   ├── eval_grpo_4b.sh        # Evaluate a 4b model without training it
 │   └── ...         
 │           
 ├── src/                       # Python codes
@@ -69,6 +70,22 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 
 ## 📚 Examples
 
+
+We trained `Qwen/Qwen3-1.7B-Base` and `Qwen/Qwen3-4B-Base` models on [MATH-benchmark](https://huggingface.co/datasets/nlile/hendrycks-MATH-benchmark), with real-time evaluation on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500) using the `evaluate` function.
+
+Below is the wandb log on evaluation dataset:
+
+<p align="center">
+  <img src="imgs/wandb_log-qwen3.png" width="800" />
+  <br>
+  📈
+  <strong>Fig 1. SimpleR1 running example (eval on MATH-500).</strong>
+  <br>
+</p>
+
+
+<details>
+  <summary>Click to expand/collapse more training examples</summary>
 
 ### Training on MATH-benchmark and evaluating on MATH-500
 
@@ -94,7 +111,7 @@ Below is the plot comparing evaluation accuracy across the four models:
 <p align="center">
   <img src="imgs/wandb_log-math.png" width="800" />
   <br>
-  <strong>Fig 1. SimpleR1 running example (eval on MATH-500).</strong>
+  <strong>Fig 2. SimpleR1 running example (eval on MATH-500).</strong>
   <br>
   📈 More train and eval logs are available at WandB project: 
       <a href="https://api.wandb.ai/links/yflyzhang/wkdme9ea">wandb log</a>.
@@ -102,13 +119,6 @@ Below is the plot comparing evaluation accuracy across the four models:
 
 
 ### Results Table
-
-<!-- | Model | Initial Accuracy | Best Accuracy | Completion Length Trend | Token Efficiency |
-| --- | --- | --- | --- | --- |
-| `Qwen2.5-1.5B` | 0.150 | 0.478 | 2,044 → 550 tokens | ↑ |
-| `Qwen2.5-1.5B-Instruct` | 0.368 | 0.492 | 455 → 552 tokens |  ↓ |
-| `Qwen2.5-Math-1.5B` | 0.432 | 0.606 | 1425 → 812 tokens | ↑ |
-| `Qwen2.5-Math-1.5B-Instruct` | 0.738 | 0.766 | 591 → 581 tokens | -- | -->
 
 
 | Model | Initial Accuracy | Best Accuracy | Completion Length Trend | Token Efficiency | Runtime |
@@ -128,7 +138,7 @@ We also trained the models on [gsm8k](https://huggingface.co/datasets/openai/gsm
 <p align="center">
 <img src="imgs/wandb_log-gsm.png" width="800" />
 <br>
-<strong>Fig 2. Train on gsm8k and evaluate on MATH-500.</strong>
+<strong>Fig 3. Train on gsm8k and evaluate on MATH-500.</strong>
 <br>
 📈 More train and eval logs are available at WandB project: 
 <a href="https://wandb.ai/yflyzhang/simpleR1-gsm8k/reports/SimpleR1-Training-Examples-gsm8k---VmlldzoxMjg1MjE4Mw?accessToken=ifm2s40kzp8a5i5n94jozsli50mdp978s9hz8ukjrqezo0frsj684l2aayvn5r7d">wandb log</a>
@@ -179,7 +189,7 @@ Below is an response example from trained `Qwen2.5-1.5B` on a MATH-500 problem:
 
 </details>
 
-
+</details>
 
 
 ## 🚀 Usage
@@ -363,6 +373,8 @@ cd simpleR1
 ### Example evaluate command:
 
 We can simply reuse the code to evaluate without training the model.
+
+Note: **simpleR1** supports evaluation on multiple datasets.
 
 
   ```bash
