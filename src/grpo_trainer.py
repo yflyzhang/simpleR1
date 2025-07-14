@@ -872,7 +872,7 @@ class GRPOTrainer(Trainer):
             return 'easy'
         
         # 2. Bad: Nearly identical rewards, e.g., std=0
-        # example: [10, 10, 10, 9.99]
+        # example: [10, 10, 10, 9.99], [2, 2, 2, 2]
         # if np.std(rewards) == 0:
         if np.std(rewards) < 1e-2:
         # TODO: change to other values or set by user
@@ -882,16 +882,22 @@ class GRPOTrainer(Trainer):
         
         # 3. Hard: accuracy reward (the primary reward)
         # If no generation arrives at the right answer, try it again.
-        if max(rewards) < max(self.reward_weights.tolist()):    
+        if max(rewards) < max(self.reward_weights.tolist()):
             return 'hard'
         # TODO: If no generation get the full reward, try it again.
-        # if max(rewards) < sum(self.reward_weights.tolist()):   
+        # if max(rewards) < sum(self.reward_weights.tolist()):
         #     return 'hard
+        
+        # 4. Good: full reward
+        # All rewards are within a certain range (at least one answer gets the full reward)
+        if max(rewards) >= sum(self.reward_weights.tolist()):
+            return 'good'
         
         # TODO: Check other conditions, e.g., generation diversity, entropy
         
-        # 4. Good: All rewards are within a certain range (with at least one right answer)
-        return 'good'
+        # 5. ok: accuracy reward, but not full reward
+        # All rewards are within a certain range (at least one answer is right but doesn't get the full reward)
+        return 'ok'
     
     
     def _generate_completions(self, inputs, mode):
@@ -2040,6 +2046,7 @@ class GRPOTrainer(Trainer):
                     
                     
                     # 3. Check if current model generation meets specific criterion
+                    # levels: ['easy', 'bad', 'hard', 'ok', 'good']
                     # Note: Change the logic here accordingly
                     checkout = self.check_model_generation(all_rewards.tolist(), **kwargs)
                     
@@ -2057,15 +2064,21 @@ class GRPOTrainer(Trainer):
                             logger.info(f"\n  [{attempt=}]: Current model generation is bad, skip to the next batch.")
                     elif checkout == 'hard':
                         if attempt < max_attempts:
-                            logger.info(f"\n  [{attempt=}]: Current model generation is not good, try again...")
+                            logger.info(f"\n  [{attempt=}]: Current model generation is hard (no right answer), try again...")
                         else:
-                            logger.info(f"\n  [{attempt=}]: Current model generation is not good, but max_attempts reached!")
+                            logger.info(f"\n  [{attempt=}]: Current model generation is hard (no right answer), but max_attempts reached!")
+                    elif checkout == 'ok':
+                        if attempt < max_attempts:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is ok (at least one right answer but no full reward), try again...")
+                        else:
+                            logger.info(f"\n  [{attempt=}]: Current model generation is ok (at least one right answer but no full reward), but max_attempts reached!")
                 
-                # 4. Dynamic sampling: Skip to the next batch if it's too easy/bad 
+                # 4. Dynamic sampling: Skip to the next batch if it's too easy/bad
                 # Note: May change the logic here accordingly. For example, accepts good completions only.
                 if self.dynamic_sampling:
-                    if checkout in ['easy', 'bad']:
-                    # if checkout != 'good':    # accepts good completions only
+                    if checkout in ['easy', 'bad']:     # accepts hard, ok, good
+                    # if checkout not in ['good', 'ok']:  # accepts good and ok completions
+                    # if checkout != 'good':              # accepts good completions only
                         # Note: Skip to the next batch. Only update progress_bar, while `global_step` remains unchanged!
                         # self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
