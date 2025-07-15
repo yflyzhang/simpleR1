@@ -104,8 +104,8 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --beta 0.0001 \
-    --compute_kl True \
+    --beta 1e-5 \
+    --repetition_penalty 1.02 \
     --lr_scheduler_type constant \
     --learning_rate 3e-6 \
     --save_strategy steps \
@@ -114,7 +114,7 @@ src/run_grpo.py \
     --eval_steps 10 \
     --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-test \
+    --wandb_project simpleR1-train \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 

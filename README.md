@@ -1,7 +1,7 @@
-<h1 align="center"> simpleR1: A simple framework for training R1-like models</h1>
+<h1 align="center"> simpleR1: A simple framework for training R1-like reasoning models</h1>
 
 
-**simpleR1** is a simple framework for training R1-like models, aiming to improve llm's reasoning abilities in math and code. 
+**simpleR1** is a simple framework for training R1-like reasoning models, aiming to improve llm's reasoning abilities. 
 This repository builds upon Hugging Face's TRL GRPO Trainer and the [open-r1](https://github.com/huggingface/open-r1) project, with a focus on ease of use and enhanced training features. 
 
 
@@ -71,9 +71,11 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ## 📚 Examples
 
 
-We trained `Qwen/Qwen3-1.7B-Base` and `Qwen/Qwen3-4B-Base` models on [MATH-benchmark](https://huggingface.co/datasets/nlile/hendrycks-MATH-benchmark), with real-time evaluation on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500) using the `evaluate` function.
+We trained `Qwen/Qwen2.5-1.5B` (base model), `Qwen/Qwen3-0.6B-Base`, `Qwen/Qwen3-1.7B-Base`,`Qwen/Qwen3-4B-Base` models on [MATH-benchmark](https://huggingface.co/datasets/nlile/hendrycks-MATH-benchmark), with real-time evaluation on [MATH-500](https://huggingface.co/datasets/HuggingFaceH4/MATH-500) using the `evaluate` function.
 
-Below is the wandb log on evaluation dataset:
+Below is the wandb log on the evaluation dataset:
+> In the log below, we simply set `num_eval_generations=1` (one completion for each problem in the eval dataset), and `num_eval_generations=k` would yield `average@k`/`avg@k` metrics.
+For other metrics, such as `pass@k`, please consider to change the logic in the `evaluate` function.
 
 <p align="center">
   <img src="imgs/wandb_log-qwen3.png" width="800" />
@@ -214,9 +216,6 @@ cd simpleR1
     > Or override additional parameters via command line. 
     > For example,
     > ```bash
-    > model_name_or_path=Qwen/Qwen2.5-1.5B
-    > train_dataset=nlile/hendrycks-MATH-benchmark
-    > eval_dataset=HuggingFaceH4/MATH-500
     > # export HF_HOME=/xxx/xxx/.cache/huggingface
     > export CUDA_VISIBLE_DEVICES=0
     > accelerate launch \
@@ -228,9 +227,9 @@ cd simpleR1
     >     --config configs/grpo_config.yaml \
     >     --output_dir $OUTPUT_DIR \
     >     --check_gpu_idle True \
-    >     --model_name_or_path $model_name_or_path \
-    >     --train_dataset_name $train_dataset \
-    >     --eval_dataset_name $eval_dataset \
+    >     --model_name_or_path Qwen/Qwen2.5-1.5B \
+    >     --train_dataset_name nlile/hendrycks-MATH-benchmark \
+    >     --eval_dataset_name HuggingFaceH4/MATH-500 \
     >     --use_vllm True \
     >     --vllm_mode colocate \
     >     --vllm_gpu_memory_utilization 0.2 \
@@ -239,12 +238,13 @@ cd simpleR1
     >     --num_eval_generations 1 \
     >     --per_device_train_batch_size 7 \
     >     --per_device_eval_batch_size 64 \
+    >     --dynamic_sampling True \
     >     --max_resample_attempts 3 \
-    >     --gradient_accumulation_steps 3 \
+    >     --gradient_accumulation_steps 1 \
     >     --num_iterations 3 \
     >     --torch_empty_cache_steps 1 \
-    >     --max_num_train_samples 2000 \
-    >     --max_num_test_samples -1 \
+    >     --num_train_samples_per_dataset 2000 \
+    >     --num_test_samples_per_dataset -1 \
     >     --max_completion_length 2048 \
     >     --max_eval_completion_length 4096 \
     >     --reward_funcs accuracy format tag \
@@ -258,8 +258,8 @@ cd simpleR1
     >     --top_p 0.95 \
     >     --eval_temperature 0.7 \
     >     --eval_top_p 0.95 \
-    >     --beta 0.0001 \
-    >     --compute_kl True \
+    >     --beta 1e-5 \
+    >     --repetition_penalty 1.02 \
     >     --lr_scheduler_type constant \
     >     --learning_rate 3e-6 \
     >     --save_strategy steps \
@@ -268,7 +268,7 @@ cd simpleR1
     >     --eval_steps 10 \
     >     --eval_on_start True \
     >     --log_level info \
-    >     --wandb_project simpleR1-$(basename $train_dataset) \
+    >     --wandb_project simpleR1-train \
     >     --run_name $model_name_or_path \
     >     2>&1 | tee train.log
     >  ```
@@ -298,7 +298,7 @@ cd simpleR1
     
     Step 2: Start the training pipeline while interacting with the vllm server
 
-    > `vllm_mode = server` is recommended.
+    > Make sure `vllm_mode = server`, which is recommended against `vllm_mode = colocate` mode.
 
     ```bash
     bash scripts/train_grpo_3b.sh
@@ -326,11 +326,11 @@ cd simpleR1
     >     --per_device_train_batch_size 5 \
     >     --per_device_eval_batch_size 64 \
     >     --max_resample_attempts 3 \
-    >     --gradient_accumulation_steps 3 \
+    >     --gradient_accumulation_steps 1 \
     >     --num_iterations 3 \
     >     --torch_empty_cache_steps 1 \
-    >     --max_num_train_samples 2000 \
-    >     --max_num_test_samples -1 \
+    >     --num_train_samples_per_dataset 2000 \
+    >     --num_test_samples_per_dataset -1 \
     >     --max_completion_length 3072 \
     >     --max_eval_completion_length 4096 \
     >     --use_vllm True \
@@ -359,7 +359,7 @@ cd simpleR1
     >     --eval_steps 10 \
     >     --eval_on_start True \
     >     --log_level info \
-    >     --wandb_project simpleR1-$(basename $train_dataset) \
+    >     --wandb_project simpleR1-train \
     >     --run_name $run_name \
     >     2>&1 | tee train.log
     > ```
@@ -374,7 +374,7 @@ cd simpleR1
 
 We can simply reuse the code to evaluate without training the model.
 
-Note: **simpleR1** supports evaluation on multiple datasets.
+Note: **simpleR1** supports training and evaluating on multiple datasets.
 
 
   ```bash
@@ -396,7 +396,7 @@ Note: **simpleR1** supports evaluation on multiple datasets.
   >   --check_gpu_idle False \
   >   --model_name_or_path $model_name_or_path \
   >   --eval_dataset_name HuggingFaceH4/MATH-500 openai/gsm8k opencompass/AIME2025 \
-  >   --num_eval_generations 2 \
+  >   --num_eval_generations 16 \
   >   --per_device_eval_batch_size 128 \
   >   --max_eval_completion_length 4096 \
   >   --use_vllm True \
@@ -444,7 +444,7 @@ pip install wandb==0.20.1
 
 ## TODOs
 - LoRA is not supported yet.
-- The current implementation of resample is not efficient.
+- The current implementation of resample is not that efficient.
 
 ## Contributing
 
@@ -455,4 +455,19 @@ Contributions are welcome! Feel free to open issues, suggest improvements, or su
 ## Acknowledgements
 
 Special thanks to the [Open-R1 project](https://github.com/huggingface/open-r1) by Hugging Face and the broader open-source AI community for their foundational work.
+
+## Citation
+
+If you find this project is useful for your work, please consider to leave a star ⭐ for this repo and cite it as follows:
+
+
+
+```
+@misc{zhang2025simpler1,
+      title={{simpleR1: A simple framework for training R1-like reasoning models}}, 
+      author={{Yafei Zhang}},
+      year={2025},
+      url={https://github.com/yflyzhang/simpleR1}, 
+}
+```
 

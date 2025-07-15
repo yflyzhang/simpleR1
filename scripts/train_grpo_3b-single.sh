@@ -118,7 +118,7 @@ src/run_grpo.py \
     --eval_steps 10 \
     --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-test \
+    --wandb_project simpleR1-train \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
