@@ -32,7 +32,8 @@ eval_dataset=HuggingFaceH4/MATH-500
 
 model_name=$(basename $model_name_or_path)
 # run_name=$model_name-$(date +%Y-%m-%d)
-run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
+# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
+run_name=${model_name}_date-$(date +%Y-%m-%d)
 
 
 OUTPUT_DIR=outputs/models/$run_name
@@ -77,10 +78,10 @@ src/run_grpo.py \
     --train_dataset_name $train_dataset \
     --eval_dataset_name $eval_dataset \
     --num_train_epochs 1 \
-    --num_generations 20 \
+    --num_generations 10 \
     --num_eval_generations 1 \
     --per_device_train_batch_size 10 \
-    --per_device_eval_batch_size 64 \
+    --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 1 \
@@ -105,18 +106,17 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --repetition_penalty 1.0 \
-    --beta 1e-6 \
-    --compute_kl True \
+    --repetition_penalty 1.02 \
+    --beta 1e-5 \
     --lr_scheduler_type constant \
     --learning_rate 5e-6 \
     --save_strategy steps \
     --save_steps 100 \
     --eval_strategy steps \
-    --eval_steps 5 \
+    --eval_steps 10 \
     --eval_on_start True \
     --log_level info \
-    --wandb_project simpleR1-test \
+    --wandb_project simpleR1-train \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
 
