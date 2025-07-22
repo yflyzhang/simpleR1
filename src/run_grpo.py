@@ -328,8 +328,8 @@ def main():
         # trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
     
-    # >>>>> add a breakpoint for debug? <<<<<
-    torch.distributed.breakpoint(rank=0)
+    # # >>>>> add a breakpoint for debug? <<<<<
+    # torch.distributed.breakpoint(rank=0)
     
     
     # Finally, destroy process group
