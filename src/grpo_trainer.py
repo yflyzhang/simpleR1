@@ -2508,18 +2508,24 @@ class GRPOTrainer(Trainer):
             del inputs, processed_inputs
             gc.collect()
             torch.cuda.empty_cache()
-        
-        # Remove redundant eval samples (in main process only)
+            
+        # Remove redundant eval samples when necessary (in main process only)
         # Note: This is important for the eval metrics for multi-device eval.
+        # Note: For single device, the last batch is not necessarily padded, and there could be no redundant samples in this case.
+        #
         # Example:
         #   Suppose we have 7 samples (e.g., [0, 1, 2, 3, 4, 5, 6]) in the eval dataset and 2 gpu devices,
-        #   if eval batch size is set to be 5, then we will have two batches: 
+        #   if eval batch size is set to be 5, then we will have two batches:
         #   [0, 1, 2, 3, 4] and [5, 6, 0, 1, 2].
-        #   We need to remove the redundant samples in the last batch.
+        #   The last bacth is padded: [5, 6, 0] -> [5, 6, 0, 1, 2].
+        #   So, we have to remove the redundant samples in the last batch to arrive accurate evaluation.
+        
         if self.accelerator.is_main_process:
             num_total_samples = num_examples * self.num_eval_generations    # raw samples * generations
-            num_returned_samples = num_update_steps_per_epoch * effective_batch_size    # samples returned to complete the last batch
-            num_redundants = num_returned_samples - num_total_samples
+            # num_completed_samples = num_update_steps_per_epoch * effective_batch_size     # not applicable for single device
+            first_metric_key = list(self._metrics[mode].keys())[0]
+            num_completed_samples = len(self._metrics[mode][first_metric_key])
+            num_redundants = num_completed_samples - num_total_samples
             
             # Remove redundant samples due to the last data batch
             if num_redundants > 0:
