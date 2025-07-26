@@ -9,9 +9,14 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 # model_name_or_path=meta-llama/Llama-3.2-1B
 # model_name_or_path=meta-llama/Llama-3.2-1B-Instruct
 
-# model_name_or_path=/mnt/sgnfsdata/tolo-02-95/yafei/Codes/SimpleR1/outputs/models/Qwen2.5-1.5B_data-hendrycks-MATH-benchmark_date-2025-05-26
-# Qwen3-1.7B_data-hendrycks-MATH-benchmark_date-2025-05-12
-# Qwen2.5-1.5B_data-hendrycks-MATH-benchmark_date-2025-05-26
+model_name_or_path=Qwen/Qwen2.5-3B
+# model_name_or_path=Qwen/Qwen2.5-3B-Instruct
+
+model_name_or_path=Qwen/Qwen3-1.7B-Base
+# model_name_or_path=Qwen/Qwen3-1.7B
+
+# Trained model
+# model_name_or_path=outputs/models/Qwen3-1.7B-Base_date-2025-07-13/checkpoint-200
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -30,8 +35,8 @@ eval_dataset=HuggingFaceH4/MATH-500
 
 
 model_name=$(basename $model_name_or_path)
-# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 run_name=${model_name}_date-$(date +%Y-%m-%d)
+# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 
 
 OUTPUT_DIR=outputs/models/$run_name
@@ -53,10 +58,9 @@ echo
 
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
- 
-# export CUDA_VISIBLE_DEVICES=0,1,2
-export CUDA_VISIBLE_DEVICES=2
-export VLLM_LOGGING_LEVEL=WARNING
+
+# export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
@@ -74,26 +78,25 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name $train_dataset \
-    --eval_dataset_name $eval_dataset \
+    --train_dataset_name nlile/hendrycks-MATH-benchmark \
+    --eval_dataset_name HuggingFaceH4/MATH-500 \
     --use_vllm True \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.25 \
+    --vllm_gpu_memory_utilization 0.3 \
+    --reward_funcs accuracy format tag \
     --num_train_epochs 1 \
     --num_generations 7 \
     --num_eval_generations 1 \
     --per_device_train_batch_size 7 \
-    --per_device_eval_batch_size 64 \
+    --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
-    --gradient_accumulation_steps 1 \
     --num_iterations 3 \
     --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
     --max_eval_completion_length 4096 \
-    --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --loss_type bnpo \
     --scale_rewards False \
@@ -104,8 +107,7 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --beta 1e-6 \
-    --repetition_penalty 1.02 \
+    --beta 0 \
     --lr_scheduler_type constant \
     --learning_rate 3e-6 \
     --save_strategy steps \
@@ -117,6 +119,7 @@ src/run_grpo.py \
     --wandb_project simpleR1-train-single \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
+
 
 
 

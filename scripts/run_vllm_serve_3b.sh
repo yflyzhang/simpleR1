@@ -6,6 +6,7 @@ export CUDA_VISIBLE_DEVICES=2
 
 python src/vllm_serve.py \
     --model Qwen/Qwen2.5-3B \
+    --seed 42 \
     --gpu_memory_utilization 0.9
 
 
