@@ -66,7 +66,8 @@ def main():
         import time
         from utils import check_gpu_free
         print("\n\n***** Check gpu idle *****")
-        wait_time = 60*5    # seconds
+        # wait_time = 60*5    # 60*5 seconds by default
+        wait_time = script_args.wait_time
         while not check_gpu_free(gpu_memory_threshold=10000, gpu_util_threshold=10):
             print(f"\nGPU is busy, waiting for {wait_time} seconds...")
             time.sleep(wait_time)  # Check every wait_time seconds

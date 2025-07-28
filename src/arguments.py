@@ -104,6 +104,12 @@ class ScriptArguments:
             "help": "If set, wait for GPU to be idle before running. If not set, run scripts without checking GPU."
         },
     )
+    wait_time: int = field(
+        default=60*5,
+        metadata={
+            "help": "Time interval to check gpu idle."
+        },
+    )
 
     gpu_memory_threshold: int = field(
         default=1000,
