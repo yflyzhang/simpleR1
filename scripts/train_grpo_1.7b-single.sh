@@ -60,7 +60,7 @@ echo
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # export CUDA_VISIBLE_DEVICES=0,1
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
@@ -107,7 +107,7 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --beta 0 \
+    --beta 1e-6 \
     --lr_scheduler_type constant \
     --learning_rate 3e-6 \
     --save_strategy steps \

@@ -1,21 +1,23 @@
 # Train via command line
 
-# model_name_or_path=Qwen/Qwen2.5-1.5B
+model_name_or_path=Qwen/Qwen2.5-1.5B
 # model_name_or_path=Qwen/Qwen2.5-1.5B-Instruct
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B
 # model_name_or_path=Qwen/Qwen2.5-Math-1.5B-Instruct
 # model_name_or_path=Qwen/Qwen3-1.7B
 
+# model_name_or_path=meta-llama/Llama-3.2-1B
+# model_name_or_path=meta-llama/Llama-3.2-1B-Instruct
 
 model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
-# model_name_or_path=meta-llama/Llama-3.2-1B
-# model_name_or_path=meta-llama/Llama-3.2-1B-Instruct
 
-# model_name_or_path=/mnt/sgnfsdata/tolo-02-95/yafei/Codes/SimpleR1/outputs/models/Qwen2.5-1.5B_data-hendrycks-MATH-benchmark_date-2025-05-26
-# Qwen3-1.7B_data-hendrycks-MATH-benchmark_date-2025-05-12
-# Qwen2.5-1.5B_data-hendrycks-MATH-benchmark_date-2025-05-26
+model_name_or_path=Qwen/Qwen3-4B-Base
+# model_name_or_path=Qwen/Qwen3-4B
+
+# Trained model
+# model_name_or_path=outputs/models/Qwen3-4B-Base_data-hendrycks-MATH-benchmark_date-2025-07-12/checkpoint-200
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -34,8 +36,10 @@ eval_dataset=HuggingFaceH4/MATH-500
 
 
 model_name=$(basename $model_name_or_path)
+# run_name=$model_name-$(date +%Y-%m-%d)
 # run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 run_name=${model_name}_date-$(date +%Y-%m-%d)
+
 
 OUTPUT_DIR=outputs/models/$run_name
 LOG_FILE="$OUTPUT_DIR/train_log_$(date +%Y-%m-%d_%H:%M:%S.log)"
@@ -58,8 +62,7 @@ echo
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 
 # export CUDA_VISIBLE_DEVICES=0,1
-export CUDA_VISIBLE_DEVICES=1
-export VLLM_LOGGING_LEVEL=WARNING
+export CUDA_VISIBLE_DEVICES=0
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
@@ -77,16 +80,16 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name $train_dataset \
-    --eval_dataset_name $eval_dataset \
+    --train_dataset_name nlile/hendrycks-MATH-benchmark  \
+    --eval_dataset_name HuggingFaceH4/MATH-500 \
     --use_vllm True \
     --vllm_mode colocate \
-    --vllm_gpu_memory_utilization 0.25 \
+    --vllm_gpu_memory_utilization 0.35 \
     --num_train_epochs 1 \
-    --num_generations 7 \
+    --num_generations 5 \
     --num_eval_generations 1 \
-    --per_device_train_batch_size 7 \
-    --per_device_eval_batch_size 48 \
+    --per_device_train_batch_size 5 \
+    --per_device_eval_batch_size 64 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 1 \
@@ -107,6 +110,7 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
+    --repetition_penalty 1.0 \
     --beta 1e-6 \
     --lr_scheduler_type constant \
     --learning_rate 3e-6 \
@@ -119,6 +123,7 @@ src/run_grpo.py \
     --wandb_project simpleR1-train-single \
     --run_name $run_name \
     2>&1 | tee $LOG_FILE
+
 
 
 
