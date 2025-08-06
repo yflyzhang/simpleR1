@@ -85,7 +85,8 @@ src/run_grpo.py \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 1 \
-    --num_iterations 3 \
+    --num_iterations 1 \
+    --max_grad_norm 1.0 \
     --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 2000 \
     --num_test_samples_per_dataset -1 \

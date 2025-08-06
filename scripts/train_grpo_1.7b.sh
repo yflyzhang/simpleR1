@@ -87,9 +87,10 @@ src/run_grpo.py \
     --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
-    --num_iterations 3 \
+    --num_iterations 1 \
+    --max_grad_norm 1.0 \
     --torch_empty_cache_steps 1 \
-    --num_train_samples_per_dataset 2000 \
+    --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
     --max_eval_completion_length 4096 \

@@ -72,7 +72,7 @@ export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 
 accelerate launch \
     --main_process_port $MASTER_PORT \
-    --config_file configs/accelerate_configs/zero1.yaml \
+    --config_file configs/accelerate_configs/zero2.yaml \
     --num_processes=2 \
 src/run_grpo.py \
     --do_train True \

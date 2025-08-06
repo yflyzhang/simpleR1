@@ -9,15 +9,10 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 # model_name_or_path=meta-llama/Llama-3.2-1B
 # model_name_or_path=meta-llama/Llama-3.2-1B-Instruct
 
-model_name_or_path=Qwen/Qwen2.5-3B
+# model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
-
-model_name_or_path=Qwen/Qwen3-4B-Base
 # model_name_or_path=Qwen/Qwen3-4B
-
-# Trained model
-# model_name_or_path=outputs/models/Qwen3-4B-Base_data-hendrycks-MATH-benchmark_date-2025-07-12/checkpoint-200
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -80,19 +75,19 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name nlile/hendrycks-MATH-benchmark  \
-    --eval_dataset_name HuggingFaceH4/MATH-500 \
+    --train_dataset_name $train_dataset \
+    --eval_dataset_name $eval_dataset \
     --num_train_epochs 1 \
-    --num_generations 5 \
+    --num_generations 10 \
     --num_eval_generations 1 \
-    --per_device_train_batch_size 5 \
-    --per_device_eval_batch_size 64 \
+    --per_device_train_batch_size 10 \
+    --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --gradient_accumulation_steps 1 \
     --num_iterations 1 \
-    --torch_empty_cache_steps 1 \
     --max_grad_norm 0.5 \
+    --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
@@ -100,7 +95,7 @@ src/run_grpo.py \
     --use_vllm True \
     --vllm_mode server \
     --vllm_server_host 0.0.0.0 \
-    --vllm_server_port 8001 \
+    --vllm_server_port 8000 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --loss_type bnpo \

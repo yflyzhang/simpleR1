@@ -12,12 +12,11 @@ model_name_or_path=Qwen/Qwen2.5-1.5B
 model_name_or_path=Qwen/Qwen2.5-3B
 # model_name_or_path=Qwen/Qwen2.5-3B-Instruct
 
-
-model_name_or_path=Qwen/Qwen3-4B-Base
-# model_name_or_path=Qwen/Qwen3-4B
+model_name_or_path=Qwen/Qwen3-1.7B-Base
+# model_name_or_path=Qwen/Qwen3-1.7B
 
 # Trained model
-# model_name_or_path=outputs/models/Qwen3-4B-Base_data-hendrycks-MATH-benchmark_date-2025-07-12/checkpoint-200
+# model_name_or_path=outputs/models/Qwen3-1.7B-Base_date-2025-07-13/checkpoint-200
 
 # train_dataset=openai/gsm8k
 train_dataset=nlile/hendrycks-MATH-benchmark
@@ -36,9 +35,8 @@ eval_dataset=HuggingFaceH4/MATH-500
 
 
 model_name=$(basename $model_name_or_path)
-# run_name=$model_name-$(date +%Y-%m-%d)
-# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 run_name=${model_name}_date-$(date +%Y-%m-%d)
+# run_name=${model_name}_data-$(basename $train_dataset)_date-$(date +%Y-%m-%d)
 
 
 OUTPUT_DIR=outputs/models/$run_name
@@ -80,19 +78,18 @@ src/run_grpo.py \
     --output_dir $OUTPUT_DIR \
     --check_gpu_idle True \
     --model_name_or_path $model_name_or_path \
-    --train_dataset_name nlile/hendrycks-MATH-benchmark  \
+    --train_dataset_name nlile/hendrycks-MATH-benchmark \
     --eval_dataset_name HuggingFaceH4/MATH-500 \
     --num_train_epochs 1 \
-    --num_generations 5 \
+    --num_generations 20 \
     --num_eval_generations 1 \
-    --per_device_train_batch_size 5 \
-    --per_device_eval_batch_size 64 \
+    --per_device_train_batch_size 10 \
+    --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
-    --gradient_accumulation_steps 1 \
     --num_iterations 1 \
-    --torch_empty_cache_steps 1 \
     --max_grad_norm 0.5 \
+    --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
@@ -100,7 +97,7 @@ src/run_grpo.py \
     --use_vllm True \
     --vllm_mode server \
     --vllm_server_host 0.0.0.0 \
-    --vllm_server_port 8001 \
+    --vllm_server_port 8000 \
     --reward_funcs accuracy format tag \
     --reward_weights 8 1 1 \
     --loss_type bnpo \
@@ -112,8 +109,7 @@ src/run_grpo.py \
     --top_p 0.95 \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
-    --repetition_penalty 1.0 \
-    --beta 1e-6 \
+    --beta 1e-5 \
     --lr_scheduler_type cosine_with_min_lr \
     --learning_rate 1e-6 \
     --save_strategy steps \

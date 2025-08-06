@@ -107,7 +107,7 @@ class ScriptArguments:
     wait_time: int = field(
         default=60*5,
         metadata={
-            "help": "Time interval to check gpu idle."
+            "help": "Time interval (seconds) to check if gpu is idle."
         },
     )
 
