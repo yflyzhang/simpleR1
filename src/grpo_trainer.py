@@ -770,7 +770,6 @@ class GRPOTrainer(Trainer):
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
         
         # train_dataloader = DataLoader(train_dataset, **dataloader_params)
-        # debug(0)
         # Note: After `accelerator.prepare`, len(train_dataloader) may be changed if we use data parallel.
         
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
@@ -845,6 +844,22 @@ class GRPOTrainer(Trainer):
 
             self.accelerator.backward(loss, **kwargs)
 
+            # Note: 
+            #   if distributed_type == DistributedType.DEEPSPEED, it will call:
+            #   self.deepspeed_engine_wrapped.backward(loss, sync_gradients=self.sync_gradients, **kwargs)
+            #   `DeepSpeedEngineWrapper.backward` -> `engine.backward(loss, **kwargs)` -> `engine.step()`
+            #   Ref: https://github.com/huggingface/accelerate/blob/v1.9.0/src/accelerate/utils/deepspeed.py#L264
+            #   
+            # Deepspeed's `engine.step` performs the following operations:
+            # - gradient accumulation check
+            # - gradient clipping
+            # - optimizer step
+            # - zero grad
+            # - checking overflow
+            # - lr_scheduler step (only if engine.lr_scheduler is not None)
+            # 
+            # That said, for DeepSpeed via accelerator, gradient clipping and zero grad are already done during loss backward!
+            
             return loss.detach()
     
     
@@ -2115,13 +2130,13 @@ class GRPOTrainer(Trainer):
                     
                     # TODO: clean context
                     # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
-                    # context = (
-                    #     functools.partial(self.accelerator.no_sync, model=model)
-                    #     if i != len(batch_samples) - 1
-                    #     and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                    #     else contextlib.nullcontext
-                    # )
-                    context = contextlib.nullcontext
+                    context = (
+                        functools.partial(self.accelerator.no_sync, model=model)
+                        # if i != len(batch_samples) - 1
+                        if self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                        else contextlib.nullcontext
+                    )
+
                     with context():
                     # with self.accelerator.accumulate(model):
                         # Training step for one batch sample
@@ -2142,7 +2157,6 @@ class GRPOTrainer(Trainer):
                         tr_loss = tr_loss + tr_loss_step
 
                     self.current_flos += float(self.floating_point_ops(processed_inputs))
-
                     
                     if do_sync_step:
                         logger.info(
@@ -2167,11 +2181,24 @@ class GRPOTrainer(Trainer):
                                     model.parameters(),
                                     args.max_grad_norm,
                                 )
+                                
+                                # DeepSpeed handles gradient clipping internally (engine.optimizer.step() during accelerator.backward), 
+                                # https://github.com/huggingface/accelerate/blob/v1.9.0/src/accelerate/accelerator.py#L2570
+                                # https://github.com/huggingface/accelerate/blob/v1.9.0/src/accelerate/utils/deepspeed.py#L264
+                                # 
+                                # but we can retrieve the original gradient norm (before clipping)
+                                # https://github.com/huggingface/accelerate/blob/v1.9.0/src/accelerate/accelerator.py#L2710
+                                # https://github.com/deepspeedai/DeepSpeed/blob/v0.16.9/deepspeed/runtime/engine.py#L2284
+                            
 
                             if (
                                 is_accelerate_available()
                                 and self.accelerator.distributed_type == DistributedType.DEEPSPEED
                             ):
+                                # `engine.get_global_grad_norm()` -> `optimizer._global_grad_norm`:
+                                # `_global_grad_norm` tracks the original grad norm before grad clipping.
+                                # https://github.com/deepspeedai/DeepSpeed/blob/v0.16.9/deepspeed/runtime/engine.py#L2284
+                                # https://github.com/deepspeedai/DeepSpeed/blob/v0.16.9/deepspeed/runtime/zero/stage_1_and_2.py#L1867
                                 grad_norm = model.get_global_grad_norm()
                                 # In some cases the grad norm may not return a float
                                 if hasattr(grad_norm, "item"):
@@ -2371,8 +2398,6 @@ class GRPOTrainer(Trainer):
         
         mode = 'eval'
         self.mode = mode
-        
-        # debug(0)
 
         # Handle multipe eval datasets
         override = eval_dataset is not None
@@ -2389,8 +2414,6 @@ class GRPOTrainer(Trainer):
                 )
                 metrics.update(dataset_metrics)
             return metrics
-        
-        # debug(0)
         
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
@@ -2573,8 +2596,6 @@ class GRPOTrainer(Trainer):
             # Note: To save the best model checkpoint in terms of accuracy, i.e., `save_strategy` is best,
             # 'args.metric_for_best_model' can be set to 'xxx/accuracy_reward'.
             print('\n\n')
-
-        # debug(0)
         
         # Log `_metrics` and `_completion_examples` (in wandb or other logging systems)
         # self.log(metrics)
