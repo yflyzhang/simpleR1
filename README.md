@@ -35,20 +35,21 @@ The latest version includes an upgraded GRPO Trainer with a custom evaluate func
 ├── configs/
 │   ├── accelerate_configs/    # Deepspeed configs
 │   │   ├── ddp.yamal          # Distributed Data Parallel (DDP) config
-│   │   ├── zero2.yamal        # Deepspeed zero2 config
+│   │   ├── zero1.yamal        # Deepspeed zero1 config
 │   │   └── ...                
 │   └── grpo_template.yaml     # Template for specifying arguments
 │       └── ...     
 │           
 ├── scripts/                   # Bash scripts to run
 │   ├── train_grpo_1.5b-single.sh # Train a 1.5b model with a single gpu
-│   ├── train_grpo_3b-single.sh   # Train a 3b model with a single gpu
+│   ├── train_grpo_4b-single.sh   # Train a 4b model with a single gpu
 │   │
-│   ├── run_vllm_serve_3b.sh   # Run a vllm server for 3b model
-│   ├── train_grpo_3b.sh       # Train a grpo 3b model
+│   ├── run_vllm_serve_3b.sh   # Run a vllm server for a 3b model
+│   ├── train_grpo_3b.sh       # Train a 3b model
 │   │
-│   ├── run_vllm_serve_1.7b.sh # Run a vllm server for 1.7b model
-│   ├── train_grpo_1.7b.sh     # Train a grpo 1.7b model
+│   ├── run_vllm_serve_4b.sh   # Run a vllm server for 4b model
+│   ├── train_grpo_4b.sh       # Train a 4b model
+│   ├── train_grpo_4b-zero1.sh # Train a 4b model with deepspeed zero1
 │   │
 │   ├── eval_grpo_4b.sh        # Evaluate a 4b model without training it
 │   └── ...         
@@ -277,9 +278,14 @@ cd simpleR1
 
 2. For multi-device training:
 
+    > [!NOTE] When training a model with DeepSpeed ZeRO-1/ZeRO-2 instead of DDP, please appropriately change the parameters therein.<br>
+    > For example, reduce the learning rate (`learning_rate=1e-6`), use warmup (`lr_scheduler_type=cosine_with_min_lr`), and decrease the max gradient norm (`max_grad_norm=0.5`) to make the training process more stable.
+
+    
+
     Step 1: Start the vllm server for generating samples
     ```bash
-    bash scripts/run_vllm_serve_3b.sh
+    bash scripts/run_vllm_serve_4b.sh
     ```
 
     > Or override additional parameters via command line. For example,
@@ -287,7 +293,7 @@ cd simpleR1
     > # export HF_HOME=/xxx/xxx/.cache/huggingface
     > export CUDA_VISIBLE_DEVICES=2,3
     > python src/vllm_serve.py \
-    >     --model Qwen/Qwen2.5-3B \
+    >     --model Qwen/Qwen3-4B-Base \
     >     --gpu_memory_utilization 0.9 \
     >     --tensor_parallel_size 2 \
     >     --data_parallel_size 1 \
@@ -301,7 +307,11 @@ cd simpleR1
     > Make sure `vllm_mode = server`, which is recommended against `vllm_mode = colocate` mode.
 
     ```bash
-    bash scripts/train_grpo_3b.sh
+    bash scripts/train_grpo_4b.sh
+    ```
+    or train with deepspeed zero1:
+    ```bash
+    bash scripts/train_grpo_4b-zero1.sh
     ```
 
     > Or override additional parameters via command line. For example,
@@ -311,13 +321,13 @@ cd simpleR1
     > export CUDA_VISIBLE_DEVICES=0,1
     > accelerate launch \
     >     --main_process_port $MASTER_PORT \
-    >     --config_file configs/accelerate_configs/zero2.yaml \
+    >     --config_file configs/accelerate_configs/zero1.yaml \
     >     --num_processes=2 \
     > src/run_grpo.py \
     >     --do_train True \
     >     --config configs/grpo_config.yaml \
     >     --output_dir $OUTPUT_DIR \
-    >     --model_name_or_path Qwen/Qwen2.5-3B \
+    >     --model_name_or_path Qwen/Qwen3-4B-Base \
     >     --train_dataset_name $train_dataset \
     >     --eval_dataset_name $eval_dataset \
     >     --num_train_epochs 1 \
@@ -327,7 +337,8 @@ cd simpleR1
     >     --per_device_eval_batch_size 64 \
     >     --max_resample_attempts 3 \
     >     --gradient_accumulation_steps 1 \
-    >     --num_iterations 3 \
+    >     --num_iterations 1 \
+    >     --max_grad_norm 0.5 \
     >     --torch_empty_cache_steps 1 \
     >     --num_train_samples_per_dataset 2000 \
     >     --num_test_samples_per_dataset -1 \
@@ -349,10 +360,10 @@ cd simpleR1
     >     --top_p 0.95 \
     >     --eval_temperature 0.7 \
     >     --eval_top_p 0.95 \
-    >     --beta 0.0001 \
+    >     --beta 1e-6 \
     >     --compute_kl True \
-    >     --lr_scheduler_type constant \
-    >     --learning_rate 3e-6 \
+    >     --lr_scheduler_type cosine_with_min_lr \
+    >     --learning_rate 1e-6 \
     >     --save_strategy steps \
     >     --save_steps 100 \
     >     --eval_strategy steps \
@@ -366,7 +377,7 @@ cd simpleR1
   
 
   > [!NOTE]
-  > `run_vllm_serve_3b.sh` and `train_grpo_3b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
+  > `run_vllm_serve_4b.sh` and `train_grpo_4b.sh` provides a concrete runing example using 3 A100-80G GPUs, please change the parameters therein accordingly.
 
 
 
@@ -420,10 +431,12 @@ See `requirements.txt` for a full list, but generally you don't need to install 
 Key dependencies include and can be installed as follows:
 
 ```bash
-# 1. Create and activate a new env named `simpler1`
-conda create --prefix simpler1 python==3.10
+# 1. Create and activate a new env named/prefixed with `simpler1`
+conda create --name simpler1 python==3.10
+# conda create --prefix simpler1 python==3.10
 # Activate the env, for example:
-conda activate /path/simpler1
+conda activate simpler1
+# conda activate /path/simpler1
 
 # 2. Install the key dependencies
 # CUDA 12.4

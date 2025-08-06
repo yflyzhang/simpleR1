@@ -72,7 +72,7 @@ export HF_HOME=/mnt/sgnfsdata/tolo-02-95/yafei/.cache/huggingface
 
 accelerate launch \
     --main_process_port $MASTER_PORT \
-    --config_file configs/accelerate_configs/zero1.yaml \
+    --config_file configs/accelerate_configs/ddp.yaml \
     --num_processes=2 \
 src/run_grpo.py \
     --do_train True \
@@ -92,7 +92,7 @@ src/run_grpo.py \
     --gradient_accumulation_steps 1 \
     --num_iterations 1 \
     --torch_empty_cache_steps 1 \
-    --max_grad_norm 0.5 \
+    --max_grad_norm 1.0 \
     --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
@@ -114,8 +114,8 @@ src/run_grpo.py \
     --eval_top_p 0.95 \
     --repetition_penalty 1.0 \
     --beta 1e-6 \
-    --lr_scheduler_type cosine_with_min_lr \
-    --learning_rate 1e-6 \
+    --lr_scheduler_type constant \
+    --learning_rate 3e-6 \
     --save_strategy steps \
     --save_steps 200 \
     --eval_strategy steps \
