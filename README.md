@@ -207,7 +207,7 @@ cd simpleR1
 ### Example training command:
 
   > [!NOTE] 
-  > When training a model with DeepSpeed ZeRO-1/ZeRO-2 instead of DDP, please appropriately change the parameters therein.
+  > When training a model with DeepSpeed ZeRO-1/ZeRO-2 instead of DDP, please appropriately change the parameters therein.<br>
   > For example, reduce the learning rate (`learning_rate=1e-6`), use warmup (`lr_scheduler_type=cosine_with_min_lr`), and decrease the max gradient norm (`max_grad_norm=0.5`) to make the training process more stable.
 
 
