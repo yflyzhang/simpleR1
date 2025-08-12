@@ -73,6 +73,7 @@ from trl.trainer.utils import (
     pad,
     print_prompt_completions_sample,
     selective_log_softmax,
+    entropy_from_logits,
 )
 
 if is_peft_available():
@@ -419,6 +420,7 @@ class GRPOTrainer(Trainer):
         self.max_resample_attempts = args.max_resample_attempts         # max number of generation attempts
         self.scale_rewards = args.scale_rewards     # scale the rewards by std or not
         self.mask_truncated_completions = args.mask_truncated_completions   # mask truncated completions
+        self.top_entropy_quantile = args.top_entropy_quantile   # keep the top-p quantile of token loss by entropy
         self.loss_type = args.loss_type
         
         # Clip higher
@@ -537,6 +539,13 @@ class GRPOTrainer(Trainer):
                         ]
                     )
                 
+                # vLLM requires the environment variables to be set for distributed training.
+                os.environ["RANK"] = str(self.accelerator.process_index)
+                os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
+                os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
+                os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+                os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
+
                 # Setup vLLM
                 self.llm = LLM(
                     model=model.name_or_path,
@@ -554,7 +563,12 @@ class GRPOTrainer(Trainer):
                     # # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
                     # max_num_batched_tokens=4096,
                 )
+
+            else:
+                raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
             
+
+            # vLLM specific sampling arguments
             # Guided decoding, if enabled
             if args.vllm_guided_decoding_regex is not None:
                 guided_decoding = GuidedDecodingParams(backend="outlines", regex=args.vllm_guided_decoding_regex)
@@ -589,7 +603,6 @@ class GRPOTrainer(Trainer):
                 guided_decoding=guided_decoding,
                 # seed=self.args.seed,
             )
-        
 
             self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
 
@@ -625,7 +638,8 @@ class GRPOTrainer(Trainer):
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
-
+        
+        # Reset the reference model (with the current model) when necessary
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
         
@@ -862,7 +876,8 @@ class GRPOTrainer(Trainer):
             
             return loss.detach()
     
-    
+
+    # Change the logic inside accordingly
     def check_model_generation(self, rewards, **kwargs):
         r"""
         Check if current generation meets specific criterion based on rewards.
@@ -1190,13 +1205,12 @@ class GRPOTrainer(Trainer):
             mean_grouped_rewards = all_rewards.view(-1, num_generations).mean(dim=1)
             mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
             
-            # Note: num_generations>1 is enabled in train mode
-            std_grouped_rewards = all_rewards.view(-1, num_generations).std(dim=1)
-            std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
-            
             # Compute the advantages
             all_advantages = all_rewards - mean_grouped_rewards
             if self.scale_rewards:
+                # Note: num_generations>1 is enabled in train mode
+                std_grouped_rewards = all_rewards.view(-1, num_generations).std(dim=1)
+                std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
                 all_advantages = all_advantages / (std_grouped_rewards + 1e-4)
         
         # Get the primary reward (i.e., accuracy reward)
@@ -1385,7 +1399,7 @@ class GRPOTrainer(Trainer):
             # If num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
-                old_per_token_logps = self._get_per_token_logps(
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:
@@ -1394,12 +1408,12 @@ class GRPOTrainer(Trainer):
             if not self.compute_kl:
                 ref_per_token_logps = None
             elif self.ref_model is not None:    # compute kl even when beta=0 (to monitor model updates)
-                ref_per_token_logps = self._get_per_token_logps(
+                ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:   # model with adapter (untested)
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
         
@@ -1420,7 +1434,71 @@ class GRPOTrainer(Trainer):
         logits /= self.temperature          # scale logits by the sampling temperature
         return selective_log_softmax(logits, input_ids)     # compute logprobs for the input tokens
     
+
+    def _get_per_token_logps_and_entropies(
+        self, 
+        model, 
+        input_ids, 
+        attention_mask, 
+        logits_to_keep,
+        compute_entropy=False,
+    ):
+        """Compute log-probs and (optional) entropies for each token."""
+
+        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
+        # Exclude the last logit: it corresponds to the next token pred
+        logits = logits[:, :-1, :]      # (B, L-1, H)
+         # Only keep the last logits_to_keep. For models that support logits_to_keep, this is a no-op.
+        logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+        # Divide logits by sampling temperature.
+        # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+        # logits /= (self.temperature + 1e-7)     # scale logits by the sampling temperature
+        logits /= self.temperature              # scale logits by the sampling temperature
+        
+        completion_ids = input_ids[:, -logits_to_keep:]
+        logps = selective_log_softmax(logits, completion_ids)   # compute logprobs
+        if compute_entropy:
+            with torch.no_grad():
+                # logps = F.log_softmax(logits, dim=-1)
+                # entropies = -(torch.exp(logps) * logps).sum(-1)
+                entropies = entropy_from_logits(logits)
+        else:
+            entropies = None
+        
+        return logps, entropies
     
+
+    def get_high_entropy_mask(
+        self, entropies: torch.Tensor, mask: torch.Tensor, threshold: float, accelerator=None
+    ) -> torch.Tensor:
+        """
+        Returns a binary mask identifying tokens whose entropy exceeds a given quantile threshold.
+
+        Args:
+            entropies (`torch.Tensor`):
+                Tensor of shape (batch_size, seq_len) with per-token entropy values.
+            mask (`torch.Tensor`):
+                Binary mask of the same shape as `entropies`, where `1` indicates valid tokens and `0` padding.
+            threshold (`float`):
+                Quantile threshold between `0.0` and `1.0` to select high-entropy tokens.
+
+        Returns:
+            `torch.Tensor`:
+                Boolean mask of shape (batch_size, seq_len), where `True` indicates tokens with entropy >= threshold and
+                `False` otherwise.
+        """
+        non_pad_entropies = entropies[mask.bool()].float()
+        if non_pad_entropies.numel() == 0:
+            return torch.zeros_like(entropies, dtype=torch.bool)
+        all_non_pad_entropies = self.accelerator.gather(non_pad_entropies)
+        # Filter out any empty tensors that might result from processes with no valid tokens
+        entropy_threshold = torch.quantile(all_non_pad_entropies, threshold)
+        masked_entropies = entropies * mask.float()
+        entropy_mask = masked_entropies >= entropy_threshold
+        return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
+    
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         r"""
         How the loss is computed by GRPOTrainer. Return loss only.
@@ -1439,7 +1517,18 @@ class GRPOTrainer(Trainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         
         # Get per_token_logps in train mode
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        # per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        # Compute the per_token_logps and the entropy at each position in the completion
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep,
+            compute_entropy=True,
+        )
+        
+        # TODO: update high-entropy tokens only?
+        if self.top_entropy_quantile < 1.0:
+            entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
+        else:
+            entropy_mask = None
         
         # Compute the KL divergence between the model and the reference model
         if self.compute_kl:
@@ -1448,6 +1537,8 @@ class GRPOTrainer(Trainer):
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
         
+        # TODO: add GSPO
+
         # Compute the loss
         advantages = inputs["advantages"]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps, 
@@ -1461,15 +1552,19 @@ class GRPOTrainer(Trainer):
         per_token_adv2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_adv1, per_token_adv2)
         
-        # Track policy gradient (pg) loss
-        pg_loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        self._metrics[mode]["pg_loss"].append(self.accelerator.gather_for_metrics(pg_loss).mean().item())
+        # Apply entropy mask?
+        if entropy_mask is not None:
+            per_token_loss = per_token_loss * entropy_mask
         
+        # Track policy gradient (pg) loss
+        num_completion_tokens = completion_mask.sum().clamp(min=1.0)
+        # Note: `completion_mask` could be all zeros if `mask_truncated_completions` is enabled!
+        # To mitigate this, use 'completion_mask.sum().clamp(min=1.0)' as the divisor (or other appropriate operations).
+        pg_loss = (per_token_loss * completion_mask).sum() / num_completion_tokens
+        self._metrics[mode]["pg_loss"].append(self.accelerator.gather(pg_loss).mean().item())
+
         if self.beta > 0.0:    # add kl loss if beta>0
             per_token_loss += self.beta * per_token_kl
-        
-        # Note: `completion_mask` could be all zeros if `mask_truncated_completions` is enabled!
-        # To mitigate this, consider to use 'completion_mask.sum().clamp(min=1.0)' as the divisor (or other appropriate operations).
         
         # Sequence-level loss: 
         if self.loss_type == "grpo":
@@ -1481,7 +1576,7 @@ class GRPOTrainer(Trainer):
             # Normalization is performed over the local batch only.
             # Longer sequences can have more influence on the overall gradient update, but 
             # particular generation pattern may help to train the model regardless of the response length.
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            loss = (per_token_loss * completion_mask).sum() / num_completion_tokens
         
         # Remove length bias by using masked_sum with a constant normalizer (ref: Dr. GRPO)
         elif self.loss_type == "dr_grpo":
@@ -1491,14 +1586,19 @@ class GRPOTrainer(Trainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
         
-        # Compute kl even when beta=0, to monitor model update
+        # Compute mean kl even when beta=0, to monitor model update
         if self.compute_kl:
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+            mean_kl = (per_token_kl * completion_mask).sum() / num_completion_tokens
+            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         
+        # Compute mean entropy
+        mean_entropy = (entropies * completion_mask).sum() / num_completion_tokens
+        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
+
+        # Compute the clipped probability ratios
         is_clipped = (coef_1 < (1 - self.epsilon)) | (coef_1 > (1 + self.epsilon_high))
-        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        self._metrics[mode]["advantage_clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
+        clip_ratio = (is_clipped * completion_mask).sum() / num_completion_tokens
+        self._metrics[mode]["advantage_clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
         
         return loss
     

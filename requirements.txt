@@ -110,7 +110,7 @@ pydantic==2.11.7
 pandas==2.3.0
 modelscope==1.27.0
 matplotlib==3.10.3
-huggingface-hub==0.33.0
+huggingface-hub==0.34.4
 cryptography==45.0.4
 anyio==4.9.0
 typer==0.16.0
@@ -119,7 +119,7 @@ starlette==0.46.2
 httpx==0.28.1
 aliyun-python-sdk-core==2.16.0
 aiohttp==3.12.13
-transformers==4.52.4
+transformers==4.55.0
 safehttpx==0.1.6
 openai==1.86.0
 gradio_client==1.10.3
@@ -131,7 +131,7 @@ peft==0.15.2
 oss2==2.19.1
 gradio==5.34.0
 datasets==3.3.2
-trl==0.18.2
+trl==0.21.0
 triton==3.2.0
 nvidia-cusparselt-cu12==0.6.2
 fastrlock==0.8.3

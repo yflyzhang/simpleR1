@@ -441,7 +441,7 @@ conda activate simpler1
 # CUDA 12.4
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-pip install transformers==4.52.4 accelerate==1.7.0 trl==0.18.2 deepspeed==0.16.9
+pip install transformers==4.55.0 accelerate==1.7.0 trl==0.21.0 deepspeed==0.16.9
 pip install flash-attn==2.7.4.post1
 pip install vllm==0.8.5.post1
 pip install math-verify==0.8.0 latex2sympy2_extended==1.10.2
