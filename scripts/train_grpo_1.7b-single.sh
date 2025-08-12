@@ -84,6 +84,7 @@ src/run_grpo.py \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization 0.3 \
     --reward_funcs accuracy format tag \
+    --reward_weights 8 1 1 \
     --num_train_epochs 1 \
     --num_generations 7 \
     --num_eval_generations 1 \
@@ -97,7 +98,6 @@ src/run_grpo.py \
     --num_test_samples_per_dataset -1 \
     --max_completion_length 2048 \
     --max_eval_completion_length 4096 \
-    --reward_weights 8 1 1 \
     --loss_type bnpo \
     --scale_rewards False \
     --mask_truncated_completions True \

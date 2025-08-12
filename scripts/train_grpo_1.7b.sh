@@ -81,14 +81,14 @@ src/run_grpo.py \
     --train_dataset_name nlile/hendrycks-MATH-benchmark \
     --eval_dataset_name HuggingFaceH4/MATH-500 \
     --num_train_epochs 1 \
-    --num_generations 20 \
+    --num_generations 10 \
     --num_eval_generations 1 \
     --per_device_train_batch_size 10 \
     --per_device_eval_batch_size 128 \
     --dynamic_sampling True \
     --max_resample_attempts 3 \
     --num_iterations 1 \
-    --max_grad_norm 1.0 \
+    --max_grad_norm 0.5 \
     --torch_empty_cache_steps 1 \
     --num_train_samples_per_dataset 1000 \
     --num_test_samples_per_dataset -1 \
@@ -110,7 +110,7 @@ src/run_grpo.py \
     --eval_temperature 0.7 \
     --eval_top_p 0.95 \
     --beta 1e-5 \
-    --lr_scheduler_type constant \
+    --lr_scheduler_type cosine_with_min_lr \
     --learning_rate 3e-6 \
     --save_strategy steps \
     --save_steps 200 \
